@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import sys
 
@@ -20,17 +19,7 @@ from sentiment_store import save_sentiment_snapshot
 
 st.set_page_config(page_title="Article Sentiment", page_icon="📰", layout="wide")
 st.title("Article Sentiment")
-st.caption("LLM-measured tone in recent Yahoo Finance articles for the stocks on the dashboard's observed list.")
-
-
-def configured_setting(name):
-    value = os.getenv(name, "")
-    if value:
-        return value
-    try:
-        return str(st.secrets.get(name, ""))
-    except Exception:
-        return ""
+st.caption("FinBERT-measured tone in recent Yahoo Finance articles for the stocks on the dashboard's observed list.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -56,19 +45,11 @@ with st.sidebar:
         help="Defaults to the same Most Actives and held-stock universe used by the main dashboard.",
     )
     article_count = st.slider("Recent articles per stock", min_value=1, max_value=8, value=3)
-    lookback_days = st.slider("Lookback window (days)", min_value=1, max_value=30, value=7)
-    ollama_url = st.text_input(
-        "Local Ollama address", value=configured_setting("OLLAMA_HOST") or "http://localhost:11434",
-        help="Ollama runs the model on this computer by default. The local service must be running.",
-    ).strip()
-    model = st.text_input(
-        "Open model", value=configured_setting("OLLAMA_SENTIMENT_MODEL") or "qwen3:8b",
-        help="Default: Qwen3 8B, an open-weight model served locally by Ollama.",
-    ).strip()
+    lookback_days = st.slider("Lookback window (days)", min_value=1, max_value=30, value=1)
     run_analysis = st.button(
         "Fetch articles and measure sentiment", type="primary", disabled=not selected_symbols,
     )
-    st.caption("Analysis runs locally through Ollama and uses your computer's CPU/GPU. Recent measured scores prioritize matching HalfTrend signals; sentiment never changes signal direction.")
+    st.caption("Analysis runs locally with FinBERT. Its model files download the first time you run it. Recent measured scores prioritize matching HalfTrend signals; sentiment never changes signal direction.")
 
 if run_analysis:
     articles = []
@@ -77,7 +58,7 @@ if run_analysis:
     scoring_error = ""
     run_config = {
         "symbols": tuple(selected_symbols), "article_count": article_count,
-        "lookback_days": lookback_days, "model": model, "ollama_url": ollama_url,
+        "lookback_days": lookback_days,
     }
     try:
         with st.spinner(f"Fetching recent articles for {len(selected_symbols)} stocks…"):
@@ -88,14 +69,12 @@ if run_analysis:
         st.session_state.article_sentiment_scores = scores
         st.session_state.article_sentiment_fetch_errors = fetch_errors
         st.session_state.article_sentiment_config = run_config
-        if articles and ollama_url and model:
+        if articles:
             try:
                 with st.spinner(f"Measuring sentiment across {len(articles)} articles…"):
-                    scores = score_articles(ollama_url, model, articles)
+                    scores = score_articles(articles)
             except Exception as exc:
                 scoring_error = f"Articles were fetched, but sentiment scoring failed: {exc}"
-        elif articles:
-            scoring_error = "Enter your Ollama address and model name to score these articles."
         st.session_state.article_sentiment_scores = scores
         st.session_state.article_sentiment_scoring_error = scoring_error
         if scores:
@@ -121,7 +100,7 @@ run_config = st.session_state.get("article_sentiment_config")
 if run_config:
     current_config = {
         "symbols": tuple(selected_symbols), "article_count": article_count,
-        "lookback_days": lookback_days, "model": model, "ollama_url": ollama_url,
+        "lookback_days": lookback_days,
     }
     if run_config != current_config:
         st.info("The displayed results use previous settings. Click **Fetch articles and measure sentiment** to refresh them.")
@@ -200,7 +179,7 @@ if articles:
                         st.caption(f"Why: {article['rationale']}")
                     st.divider()
     else:
-        st.info("Articles were fetched, but there are no LLM scores to show yet.")
+        st.info("Articles were fetched, but there are no FinBERT scores to show yet.")
 elif run_config:
     st.info("No recent articles were returned for this selection and lookback window.")
 else:

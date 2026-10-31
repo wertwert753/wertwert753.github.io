@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 datas = [('C:/Users/Benny Benigno/tastytrader/stocktrader.py', '.'), ('C:/Users/Benny Benigno/tastytrader/stocktrader.html', '.')]
 binaries = []
-hiddenimports = ['fastapi', 'uvicorn', 'pydantic', 'pandas', 'plotly.graph_objects', 'yfinance', 'zoneinfo.ZoneInfo', 'market_data', 'strategy', 'sentiment_store', 'observed_universe', 'trading_service', 'tastytrade_client_v4']
+hiddenimports = ['fastapi', 'uvicorn', 'pydantic', 'pandas', 'plotly.graph_objects', 'yfinance', 'zoneinfo.ZoneInfo', 'market_data', 'strategy', 'sentiment_store', 'observed_universe', 'trading_service', 'tastytrade_client_orders', 'article_sentiment', 'sentiment_scheduler', 'transformers', 'torch']
 
 
 a = Analysis(

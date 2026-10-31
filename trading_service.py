@@ -16,7 +16,7 @@ from market_data import fetch_most_active_symbols, fetch_yfinance_delayed_closes
 from observed_universe import save_observed_symbols
 from sentiment_store import load_sentiment_snapshot, sentiment_priority
 from strategy import crossover_signals
-from tastytrade_client_v4 import PRODUCTION_URL, SANDBOX_URL, TastytradeAPIError, TastytradeClient
+from tastytrade_client_orders import PRODUCTION_URL, SANDBOX_URL, TastytradeAPIError, TastytradeClient
 
 
 PT, ET = ZoneInfo("America/Los_Angeles"), ZoneInfo("America/New_York")
@@ -74,6 +74,7 @@ class TradingService:
             CREATE TABLE IF NOT EXISTS sandbox_sim_positions(account_key TEXT NOT NULL,symbol TEXT NOT NULL,quantity REAL NOT NULL,average_price REAL NOT NULL,last_price REAL NOT NULL,opened_at TEXT NOT NULL,PRIMARY KEY(account_key,symbol));
             CREATE TABLE IF NOT EXISTS sandbox_sim_trades(id INTEGER PRIMARY KEY,account_key TEXT NOT NULL,trading_day TEXT NOT NULL,symbol TEXT NOT NULL,signal_time TEXT NOT NULL,signal TEXT NOT NULL,action TEXT NOT NULL,quantity REAL NOT NULL,price REAL NOT NULL,realized_pnl REAL NOT NULL,created_at TEXT NOT NULL,UNIQUE(account_key,symbol,signal_time,signal));
             CREATE TABLE IF NOT EXISTS sandbox_sim_equity(id INTEGER PRIMARY KEY,account_key TEXT NOT NULL,timestamp TEXT NOT NULL,equity REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS sandbox_sim_equity_adjustments(id INTEGER PRIMARY KEY,account_key TEXT NOT NULL,timestamp TEXT NOT NULL,amount REAL NOT NULL);
             """)
 
     def configure(self, values):
@@ -88,6 +89,39 @@ class TradingService:
             allowed = self.settings["periods"].get(interval, ["5d"])
             if self.settings["period"] not in allowed:
                 self.settings["period"] = allowed[-1]
+
+    def set_virtual_equity(self, value):
+        """Adjust Sandbox equity without altering the persisted trade ledger."""
+        target = float(value)
+        if not math.isfinite(target) or target <= 0 or target > 100_000_000:
+            raise ValueError("Virtual equity must be greater than $0 and no more than $100,000,000.")
+        with self.lock:
+            if self.settings["environment"] != "Sandbox":
+                raise ValueError("Virtual equity can only be changed in Sandbox mode.")
+            initial_capital = float(self.settings["initial_capital"])
+        key = self._simulator_key()
+        with sqlite3.connect(self.db_path) as db:
+            trades = db.execute(
+                "SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?", (key,)
+            ).fetchone()[0]
+            positions = db.execute(
+                "SELECT quantity,average_price,last_price FROM sandbox_sim_positions WHERE account_key=?", (key,)
+            ).fetchall()
+            adjustments = db.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?", (key,)
+            ).fetchone()[0]
+            unrealized = sum(q * (mark - avg) for q, avg, mark in positions)
+            current = initial_capital + float(trades) + unrealized + float(adjustments)
+            adjustment = target - current
+            timestamp = datetime.now(PT).isoformat(timespec="seconds")
+            db.execute(
+                "INSERT INTO sandbox_sim_equity_adjustments(account_key,timestamp,amount) VALUES(?,?,?)",
+                (key, timestamp, adjustment),
+            )
+            db.execute(
+                "INSERT INTO sandbox_sim_equity(account_key,timestamp,equity) VALUES(?,?,?)",
+                (key, timestamp, target),
+            )
 
     def connect(self, environment):
         if environment == "Sandbox":
@@ -346,9 +380,10 @@ class TradingService:
                     if q==0:
                         held=db.execute("SELECT quantity,average_price,last_price FROM sandbox_sim_positions WHERE account_key=?",(key,)).fetchall()
                         realized_before=db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",(key,)).fetchone()[0]
+                        adjustment_before=db.execute("SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",(key,)).fetchone()[0]
                         exposure=sum(abs(hq)*hmark for hq,havg,hmark in held)
                         unrealized_before=sum(hq*(hmark-havg) for hq,havg,hmark in held)
-                        equity_before=max(0.0,float(cfg["initial_capital"])+float(realized_before)+unrealized_before)
+                        equity_before=max(0.0,float(cfg["initial_capital"])+float(realized_before)+unrealized_before+float(adjustment_before))
                         budget=min(equity_before*float(cfg["sim_allocation_pct"])/100,
                                    max(0.0,equity_before-exposure))
                         trade_qty=round(budget/price,6) if budget>0 else 0
@@ -362,8 +397,9 @@ class TradingService:
                     db.execute("INSERT OR IGNORE INTO sandbox_sim_trades(account_key,trading_day,symbol,signal_time,signal,action,quantity,price,realized_pnl,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(key,now.date().isoformat(),symbol,stamp,side,action,trade_qty,price,realized,now.isoformat()))
             rows=db.execute("SELECT quantity,average_price,last_price FROM sandbox_sim_positions WHERE account_key=?",(key,)).fetchall()
             realized=db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",(key,)).fetchone()[0]
+            adjustments=db.execute("SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",(key,)).fetchone()[0]
             pnl=float(realized)+sum(q*(mark-avg) for q,avg,mark in rows)
-            equity=float(cfg["initial_capital"])+pnl
+            equity=float(cfg["initial_capital"])+pnl+float(adjustments)
             db.execute("INSERT INTO sandbox_sim_equity(account_key,timestamp,equity) VALUES(?,?,?)",(key,now.isoformat(),equity))
 
     def _simulator_summary(self, cfg):
@@ -373,6 +409,7 @@ class TradingService:
             daily_history=db.execute("SELECT trading_day,ROUND(SUM(realized_pnl),2) FROM sandbox_sim_trades WHERE account_key=? GROUP BY trading_day ORDER BY trading_day DESC LIMIT 60",(key,)).fetchall()
             equity=db.execute("SELECT timestamp,equity FROM sandbox_sim_equity WHERE account_key=? ORDER BY timestamp",(key,)).fetchall()
             realized=db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",(key,)).fetchone()[0]
+            adjustments=db.execute("SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",(key,)).fetchone()[0]
             today=datetime.now(PT).date().isoformat()
             daily=db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=? AND trading_day=?",(key,today)).fetchone()[0]
             open_rows=db.execute("SELECT quantity,average_price,last_price FROM sandbox_sim_positions WHERE account_key=?",(key,)).fetchall()
@@ -381,7 +418,7 @@ class TradingService:
         return {"initial_capital":cfg["initial_capital"],"daily_profit":daily,"total_profit":total,
                 "daily_profit_pct":daily/float(cfg["initial_capital"])*100,
                 "total_profit_pct":total/float(cfg["initial_capital"])*100,
-                "unrealized_profit":unrealized,"equity_value":float(cfg["initial_capital"])+total+unrealized,
+                "unrealized_profit":unrealized,"equity_value":float(cfg["initial_capital"])+total+unrealized+float(adjustments),
                 "equity":[{"time":r[0],"value":r[1]} for r in equity[-1000:]],
                 "daily":[{"day":r[0],"realized_pnl":r[1]} for r in daily_history],
                 "trades":[{"day":r[0],"symbol":r[1],"signal":r[2],"action":r[3],"quantity":r[4],"price":r[5],"realized_pnl":r[6],"time":r[7]} for r in trades]}

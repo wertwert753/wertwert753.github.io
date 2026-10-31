@@ -1,13 +1,13 @@
 # StockTrader
 
-A local FastAPI application for Yahoo Finance HalfTrend candles, tastytrade account monitoring, and LLM-measured sentiment in financial articles.
+A local FastAPI application for Yahoo Finance HalfTrend candles, tastytrade account monitoring, and FinBERT-measured sentiment in financial articles.
 
 ## Run
 
-From this project folder, install or update dependencies and start the app:
+On Windows, start StockTrader with the project launcher. It uses the project's virtual environment and installs missing dependencies there before starting the web server:
 
 ```powershell
-python -m pip install -r requirements_tastytraderbot_v4.txt
+.\run_stocktrader.bat
 ```
 
 StockTrader listens on all network interfaces at port `8765` by default and does not require a username or password. The host computer has full controls at `http://127.0.0.1:8765`; other computers can view the dashboard but cannot change settings, run sentiment analysis, or control trading. Use the host computer's LAN address, such as `http://192.168.1.25:8765`, from another device. The host firewall must allow inbound connections on a trusted network. Do not expose the trading service to the public internet.
@@ -47,13 +47,9 @@ The **Article Sentiment** tab analyzes recent Yahoo Finance search articles for 
 
 Recent sentiment is combined with HalfTrend signals to prioritize order processing: positive scores favor BUY signals and negative scores favor SELL signals, with stronger scores and higher confidence ranked first. Sentiment never creates a trade or changes a HalfTrend direction, and snapshots older than 24 hours are ignored. Re-run analysis on the Article Sentiment tab to refresh the ranking data.
 
-Article scoring uses the open Qwen3 8B model served locally by Ollama; no ChatGPT/OpenAI API key is required. Install [Ollama](https://ollama.com/download), then download the model once:
+Article scoring uses the ProsusAI FinBERT financial sentiment classifier through Transformers and PyTorch. Install the project requirements; the model files are downloaded from Hugging Face the first time you run sentiment analysis and cached locally. Inference then runs on the StockTrader computer using its available CPU/GPU. The app scores article headlines and summaries and saves aggregated results locally for strategy ranking. FinBERT measures general financial tone and does not determine whether the tone is specifically about the selected stock.
 
-```powershell
-ollama pull qwen3:8b
-```
-
-Keep Ollama running while using the tab. It defaults to `http://localhost:11434` and `qwen3:8b`. Model inference runs on your computer and uses its available CPU/GPU resources. The app sends article headlines and summaries to the local Ollama service and saves aggregated scores locally for strategy ranking.
+While StockTrader is running, it automatically analyzes three recent articles per observed stock at 6:00 a.m. Pacific on U.S. market weekdays. It checks the top Yahoo Finance result for each stock hourly from 7:00 a.m. through noon Pacific, scoring only article IDs not already analyzed that day. A fresh daily article set is fetched the following market day. The schedule skips weekends and standard U.S. market holidays, and it catches up the daily batch if StockTrader starts later in the morning.
 
 ## Data and operational limits
 

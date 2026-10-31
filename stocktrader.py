@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import ipaddress
 import os
-from pathlib import Path
 from urllib.parse import urlsplit
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request
@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from trading_service import TradingService
 
 APP_DIR = Path(__file__).resolve().parent
+NUM_MOST_ACTIVE_SYMBOLS = 100
 service = TradingService(APP_DIR / "trading_dashboard.sqlite3")
 refresh_lock = asyncio.Lock()
 
@@ -27,6 +28,11 @@ async def refresh_worker():
                 await asyncio.to_thread(service.refresh)
         except Exception as exc:
             service.last_error = f"Refresh failed: {exc}"
+        try:
+            from sentiment_scheduler import run_due_sentiment
+            await asyncio.to_thread(run_due_sentiment, APP_DIR / "trading_dashboard.sqlite3")
+        except Exception as exc:
+            service.last_error = f"Scheduled sentiment analysis failed: {exc}"
         await asyncio.sleep(60)
 
 
@@ -71,19 +77,19 @@ class Controls(BaseModel):
     arm: bool = False
     production_ack: bool = False
     live_phrase: str = ""
+    virtual_equity: float | None = None
 
 
 class SentimentRequest(BaseModel):
     symbols: list[str]
     per_symbol: int = 3
-    lookback_days: int = 7
-    model: str = "qwen3:8b"
-    ollama_url: str = "http://localhost:11434"
+    lookback_days: int = 1
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse((APP_DIR / "stocktrader.html").read_text(encoding="utf-8"))
+    return HTMLResponse((APP_DIR / "stocktrader.html").read_text(encoding="utf-8"),
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/state")
@@ -97,7 +103,11 @@ async def update_settings(request: Controls, _local=Depends(is_local_request)):
     if not _local:
         raise HTTPException(403, "Settings can only be changed on the StockTrader host.")
     async with refresh_lock:
+        previous_environment = service.settings["environment"]
         service.configure(request.settings)
+        if service.settings["environment"] != previous_environment:
+            snapshot = await asyncio.to_thread(service.refresh)
+            return {"ok": True, "snapshot": snapshot}
     return {"ok": True}
 
 
@@ -110,6 +120,11 @@ async def controls(request: Controls, _local=Depends(is_local_request)):
             service.configure(request.settings)
             if request.action == "connect":
                 result = await asyncio.to_thread(service.connect, service.settings["environment"])
+            elif request.action == "set_virtual_equity":
+                if request.virtual_equity is None:
+                    raise HTTPException(400, "Enter a virtual equity amount.")
+                await asyncio.to_thread(service.set_virtual_equity, request.virtual_equity)
+                result = {"virtual_equity": request.virtual_equity}
             elif request.action in {"start", "stop"}:
                 service.automate(request.action, request.arm, request.production_ack, request.live_phrase)
                 result = {"automation": service.auto_enabled}
@@ -132,7 +147,7 @@ def sentiment_universe():
     symbols = load_observed_symbols(APP_DIR / "trading_dashboard.sqlite3")
     if not symbols:
         try:
-            symbols = fetch_most_active_symbols(50)
+            symbols = fetch_most_active_symbols(NUM_MOST_ACTIVE_SYMBOLS)
         except Exception as exc:
             raise HTTPException(503, f"Could not load the observed stocks: {exc}") from exc
     return {"symbols": symbols}
@@ -147,14 +162,6 @@ def sentiment(request: SentimentRequest, _local=Depends(is_local_request)):
     symbols = list(dict.fromkeys(s.strip().upper() for s in request.symbols if s.strip()))
     if not symbols:
         raise HTTPException(400, "Choose at least one stock.")
-    parsed_url=urlsplit(request.ollama_url)
-    host=(parsed_url.hostname or "").lower()
-    is_local=host=="localhost"
-    if not is_local and host:
-        try: is_local=ipaddress.ip_address(host).is_loopback
-        except ValueError: is_local=False
-    if parsed_url.scheme!="http" or not is_local:
-        raise HTTPException(400, "Ollama must be running locally (localhost or a loopback address).")
     try:
         articles, errors = fetch_stock_articles(symbols, per_symbol=max(1, min(8, request.per_symbol)),
                                                 lookback_days=max(1, min(30, request.lookback_days)))
@@ -163,7 +170,7 @@ def sentiment(request: SentimentRequest, _local=Depends(is_local_request)):
     scores, scoring_error = {}, ""
     if articles:
         try:
-            scores = score_articles(request.ollama_url, request.model, articles)
+            scores = score_articles(articles)
         except Exception as exc:
             scoring_error = str(exc)
     saved = save_sentiment_snapshot(APP_DIR / "trading_dashboard.sqlite3", articles, scores) if scores else 0

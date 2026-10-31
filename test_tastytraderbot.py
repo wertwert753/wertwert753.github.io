@@ -2,7 +2,7 @@ import unittest
 import pandas as pd
 import numpy as np
 from strategy import crossover_signals, run_csv_backtest
-from tastytrade_client_v4 import TastytradeClient, SANDBOX_URL, PRODUCTION_URL
+from tastytrade_client_orders import TastytradeClient, SANDBOX_URL, PRODUCTION_URL
 
 
 class StrategyTests(unittest.TestCase):

@@ -19,7 +19,7 @@ from market_data import fetch_most_active_symbols, fetch_yfinance_delayed_closes
 from observed_universe import save_observed_symbols
 from sentiment_store import load_sentiment_snapshot, sentiment_priority
 from strategy import crossover_signals
-from tastytrade_client_v4 import (
+from tastytrade_client_orders import (
     PRODUCTION_URL,
     SANDBOX_URL,
     TastytradeAPIError,
@@ -33,6 +33,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "trading_dashboard.sqlite3"
 TERMINAL_ORDER_STATES = {"filled", "cancelled", "canceled", "rejected", "expired"}
 INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
+FIRST_TRADE = True # first trade flag
 
 st.set_page_config(page_title="StockTrader", page_icon="📈", layout="wide")
 st.title("StockTrader")
@@ -371,12 +372,39 @@ def in_regular_session():
     return now.weekday() < 5 and wall_time(9, 30) <= now.time().replace(tzinfo=None) < wall_time(16, 0)
 
 
-def in_preclose_window(now_et=None):
-    """The closeout window starts 15 minutes before the 1 p.m. Pacific close."""
-    now = now_et or datetime.now(ET)
-    local_time = now.time().replace(tzinfo=None)
-    return now.weekday() < 5 and wall_time(15, 45) <= local_time < wall_time(16, 0)
+def in_preclose_window(now_pt=None):
+    """Closeout window: 12:45–1:00 p.m. Pacific."""
+    now = now_pt or datetime.now(PT)
 
+    # Ensure Pacific timezone
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=PT)
+    else:
+        now = now.astimezone(PT)
+
+    local_time = now.time().replace(tzinfo=None)
+
+    return (
+        now.weekday() < 5
+        and wall_time(12, 45) <= local_time < wall_time(13, 0)
+    )
+
+def in_beginning_window(now_pt=None):
+    """Closeout window: 12:45–1:00 p.m. Pacific."""
+    now = now_pt or datetime.now(PT)
+
+    # Ensure Pacific timezone
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=PT)
+    else:
+        now = now.astimezone(PT)
+
+    local_time = now.time().replace(tzinfo=None)
+
+    return (
+        now.weekday() < 5
+        and wall_time(6, 31) <= local_time < wall_time(7, 45)
+    )
 
 def bar_freshness(frame, interval):
     if frame.empty:
@@ -408,8 +436,8 @@ def make_chart(frame, indicator, symbol, interval):
     fig = go.Figure()
     fig.add_trace(go.Candlestick(x=plot_frame.index, open=plot_frame.Open, high=plot_frame.High,
                                  low=plot_frame.Low, close=plot_frame.Close, name=symbol))
-    fig.add_trace(go.Scatter(x=plot_frame.index, y=plot_indicator.ht, name="HalfTrend",
-                             line={"color": "royalblue", "width": 1.5}))
+    #fig.add_trace(go.Scatter(x=plot_frame.index, y=plot_indicator.ht, name="HalfTrend",
+    #                         line={"color": "royalblue", "width": 1.5}))
     buys = plot_indicator[plot_indicator.buy_signal]
     sells = plot_indicator[plot_indicator.sell_signal]
     fig.add_trace(go.Scatter(x=buys.index, y=plot_frame.loc[buys.index, "Low"], mode="markers",
@@ -439,6 +467,24 @@ def render_equity_history(history, value_column, title, widget_key):
                       margin={"l": 10, "r": 10, "t": 45, "b": 10})
     st.plotly_chart(fig, use_container_width=True)
 
+def get_last_signal(df):
+    buy_signals = df[df['buy_signal'] == True]
+    sell_signals = df[df['sell_signal'] == True]
+    if len(buy_signals) == 0 and len(sell_signals) == 0:
+        raise Exception('No Signals')
+    if len(buy_signals) == 0:
+        last_sell = sell_signals.index[-1]
+        loc = df.index.get_loc(last_sell)
+        return 'SELL', loc
+    if len(sell_signals) == 0:
+        last_buy = buy_signals.index[-1]
+        loc = df.index.get_loc(last_buy)
+        return 'BUY', loc
+    last_buy = buy_signals.index[-1]
+    last_sell = sell_signals.index[-1]
+    sell_loc = df.index.get_loc(last_sell)
+    buy_loc = df.index.get_loc(last_buy)
+    return 'BUY', buy_loc if last_buy > last_sell else 'SELL', sell_loc
 
 init_db()
 
@@ -571,7 +617,7 @@ if production and client and account_rows:
         index=next((i for i, row in enumerate(account_rows) if row[0] == st.session_state.tt_account), 0))
     st.session_state.tt_account = account_rows[labels.index(selected_label)][0]
 
-@st.fragment(run_every="60s")
+@st.fragment(run_every="15s")
 def render_dashboard():
     active_client = st.session_state.tt_client
     account_number = st.session_state.tt_account
@@ -601,7 +647,16 @@ def render_dashboard():
         universe_ok = False
 
     held = [str(p.get("underlying-symbol", p.get("symbol", ""))).upper() for p in position_items]
-    symbols = list(dict.fromkeys(symbols + [s for s in held if s]))
+    if sandbox_mode:
+        # Include virtual holdings in the monitored universe so their reversal
+        # signals are computed even though Sandbox has no broker positions.
+        sim_key_for_universe = sandbox_simulator_key()
+        sim_positions_for_universe, _, _, _ = sandbox_sim_snapshot(
+            sim_key_for_universe, sandbox_sim_starting_capital
+        )
+        held.extend(sim_positions_for_universe.keys())
+    held = list(dict.fromkeys(s for s in held if s))
+    symbols = list(dict.fromkeys(symbols + held))
     save_observed_symbols(DB_PATH, symbols)
     st.caption(f"Yahoo Most Actives · {len(symbols)} monitored symbols · {interval} bars · {period} history · refreshed {datetime.now(PT).strftime('%I:%M:%S %p PT')}")
 
@@ -617,6 +672,7 @@ def render_dashboard():
     indicators = {}
     usable_frames = {}
     signal_by_symbol = {}
+    last_signal_by_symbol = {}
     sentiment_by_symbol = load_sentiment_snapshot(DB_PATH, max_age_hours=24)
     now_utc = pd.Timestamp.now(tz="UTC")
     interval_mins = INTERVAL_MINUTES[interval]
@@ -634,10 +690,18 @@ def render_dashboard():
             end_of_bar, age = bar_freshness(frame, interval)
         indicators[symbol] = indicator
         usable_frames[symbol] = frame
-        row = indicator.iloc[-1]
-        bar_time = str(indicator.index[-1])
-        signal = "BUY" if bool(row.buy_signal) else ("SELL" if bool(row.sell_signal) else "HOLD")
-        signal_by_symbol[symbol] = (signal, bar_time, float(frame.iloc[-1].Close), age)
+        print("First Trade Prior")
+        if FIRST_TRADE and in_beginning_window():
+            print("First Trade Imminent")
+            signal, loc = get_last_signal(indicator)
+            row = indicator.iloc[loc]
+            bar_time = str(indicator.index[loc])
+            FIRST_TRADE = False
+        else:
+            loc = -1
+            bar_time = str(indicator.index[loc])
+            signal = "BUY" if bool(row.buy_signal) else ("SELL" if bool(row.sell_signal) else "HOLD")
+        signal_by_symbol[symbol] = (signal, bar_time, float(frame.iloc[loc].Close), age)
         measured = sentiment_by_symbol.get(symbol, {})
         priority = sentiment_priority(signal, measured)
         priority_label = ("No signal" if signal == "HOLD" else
@@ -649,6 +713,10 @@ def render_dashboard():
                             "Sentiment confidence (%)": round(measured["confidence"], 0) if measured else None,
                             "Sentiment alignment": priority_label,
                             "Sentiment priority": round(priority[1], 0)})
+
+        # for beginning of trading day signals
+        last_signal = get_last_signal(indicator)
+        last_signal_by_symbol[symbol] = (last_signal, bar_time, float(frame.iloc[-1].Close), age)
 
     quote_map = {}
     quote_client = active_client if not sandbox_mode else None
@@ -747,8 +815,8 @@ def render_dashboard():
                                    "Market value": abs(qty) * mark, "Unrealized P&L": unrealized})
 
         event_account_key = sandbox_simulator_key() if sandbox_mode else f"{environment}:{account_number}"
-        now_et = datetime.now(ET)
-        eod_closeout_window = in_preclose_window(now_et)
+        now_pt = datetime.now(PT)
+        eod_closeout_window = in_preclose_window()
         sim_price_map = {}
         if sandbox_mode:
             for symbol in set(quote_map) | set(usable_frames):
@@ -763,7 +831,7 @@ def render_dashboard():
             if eod_closeout_window:
                 for symbol, sim_position in sim_positions.items():
                     close_price = sim_price_map.get(symbol, sim_position["last_price"])
-                    close_sandbox_sim_position(event_account_key, symbol, close_price, now_et)
+                    close_sandbox_sim_position(event_account_key, symbol, close_price, now_pt)
             elif in_regular_session():
                 ordered_signals = sorted(
                     signal_by_symbol.items(),
@@ -1023,7 +1091,7 @@ def render_dashboard():
                     if symbol in active_symbols:
                         close_pending.append(symbol)
                         continue
-                    prior = get_event(event_account_key, symbol, now_et.date().isoformat(), "EOD_EXIT")
+                    prior = get_event(event_account_key, symbol, now_pt.date().isoformat(), "EOD_EXIT")
                     if prior:
                         prior_status, prior_id = prior
                         prior_order = next((item.get("order", item) for item in orders
@@ -1082,13 +1150,13 @@ def render_dashboard():
                         active_symbols.add(symbol)
                         close_submitted += 1
                         details = f"Production preclose order submitted ({action} {quantity:g} shares); reference price ${reference_price:.2f}."
-                        update_event(event_account_key, symbol, now_et.date().isoformat(), "EOD_EXIT",
+                        update_event(event_account_key, symbol, now_pt.date().isoformat(), "EOD_EXIT",
                                      "Submitted", details, order["external-identifier"])
                     except Exception as exc:
                         message = f"{symbol}: {str(exc)[:250]}"
                         close_failures.append(message)
                         if order:
-                            update_event(event_account_key, symbol, now_et.date().isoformat(), "EOD_EXIT",
+                            update_event(event_account_key, symbol, now_pt.date().isoformat(), "EOD_EXIT",
                                          "Close error / check broker", message, order.get("external-identifier", ""))
                 if close_failures:
                     st.error("Production preclose closeout needs attention: " + "; ".join(close_failures))

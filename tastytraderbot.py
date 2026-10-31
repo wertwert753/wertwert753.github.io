@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from tastytrade_client_v4 import TastytradeClient, TastytradeAPIError, SANDBOX_URL, PRODUCTION_URL
+from tastytrade_client_orders import TastytradeClient, TastytradeAPIError, SANDBOX_URL, PRODUCTION_URL
 from strategy import run_csv_backtest, crossover_signals
 from market_data import fetch_yfinance_history, fetch_yfinance_ohlc
 
@@ -276,7 +276,7 @@ with strategy_tab:
         st.subheader("Open positions at end of test")
         st.dataframe(open_positions, use_container_width=True, hide_index=True)
         st.download_button("Download backtest trade history", trades.to_csv(index=False).encode(),
-                           "tastytraderbot_v4_trades.csv", "text/csv")
+                           "tastytraderbot_trades.csv", "text/csv")
 
 with orders_tab:
     st.subheader("Equity limit-order preview and submission")

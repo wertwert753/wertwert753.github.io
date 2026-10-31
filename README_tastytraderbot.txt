@@ -20,16 +20,16 @@
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements_tastytraderbot_v4.txt
-python -m streamlit run tastytraderbot_v4.py
+python -m pip install -r requirements_tastytraderbot.txt
+python -m streamlit run tastytraderbot.py
 ```
 
 ## Install (macOS/Linux)
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements_tastytraderbot_v4.txt
-python -m streamlit run tastytraderbot_v4.py
+python -m pip install -r requirements_tastytraderbot.txt
+python -m streamlit run tastytraderbot.py
 ```
 
 ## Sandbox credentials
@@ -40,7 +40,7 @@ Create a sandbox OAuth app/grant in tastytrade. Set these in your terminal befor
 $env:TASTYTRADE_CLIENT_SECRET="a7c8209f93b88dc56b8fb3b25929b5bc1fc5562a"
 $env:TASTYTRADE_REFRESH_TOKEN="eyJhbGciOiJFZERTQSIsInR5cCI6InJ0K2p3dCIsImtpZCI6InJfQWVKWW0zMmJxeWJKdzBQT0xKZlg4V3U4b19lc09vZlJvWXhodC1COUkiLCJqa3UiOiJodHRwOi8vc2FuZGJveC1uZ2lueC5zZXJ2aWNlLmNvbnN1bDo4MDgwL29hdXRoL2p3a3MifQ.eyJpc3MiOiJodHRwczovL2FwaS5zYW5kYm94LnRhc3R5d29ya3MuY29tIiwic3ViIjoiVTdkZmM0OTM3LWU0MjAtNGE2MS1hYTM4LTFjMDk1OGVhY2QyOCIsImlhdCI6MTc5MTY4NTE0MywiYXVkIjoiMDRkYjkyY2MtYzc0ZS00NTA3LWI0NTUtMDEzZjk1YzUwOTViIiwiZ3JhbnRfaWQiOiJHMGRhOGM2MmMtMjNkNy00ZjQ0LTg3NDMtNjdjOGVmZTE5YThmIiwic2NvcGUiOiJyZWFkIHRyYWRlIG9wZW5pZCJ9.iOFx0EPWI_U73VYskTSUl0b6JG6twMEx3CJiGD5CKKFkkhIcYgpYDdWRGBvLaRVpt9dtin0OpdegpsI4lq5JDg"
 $env:TASTYTRADE_CLIENT_ID="04db92cc-c74e-4507-b455-013f95c5095b"
-python -m streamlit run tastytraderbot_v4.py
+python -m streamlit run tastytraderbot.py
 ```
 
 ### macOS/Linux
@@ -48,7 +48,7 @@ python -m streamlit run tastytraderbot_v4.py
 export TASTYTRADE_CLIENT_ID="YOUR_SANDBOX_CLIENT_ID"
 export TASTYTRADE_CLIENT_SECRET="YOUR_SANDBOX_CLIENT_SECRET"
 export TASTYTRADE_REFRESH_TOKEN="YOUR_SANDBOX_REFRESH_TOKEN"
-python -m streamlit run tastytraderbot_v4.py
+python -m streamlit run tastytraderbot.py
 ```
 
 ## Production credentials
@@ -66,7 +66,7 @@ You can also upload a CSV with a `timestamp`, `date`, `datetime`, or `time` colu
 
 ## Test
 ```bash
-python -m unittest -v test_tastytraderbot_v4.py
+python -m unittest -v test_tastytraderbot.py
 ```
 
 ## Official references
