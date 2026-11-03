@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field
 from trading_service import TradingService
 
 APP_DIR = Path(__file__).resolve().parent
-NUM_MOST_ACTIVE_SYMBOLS = 100
 service = TradingService(APP_DIR / "trading_dashboard.sqlite3")
 refresh_lock = asyncio.Lock()
 
@@ -147,7 +146,7 @@ def sentiment_universe():
     symbols = load_observed_symbols(APP_DIR / "trading_dashboard.sqlite3")
     if not symbols:
         try:
-            symbols = fetch_most_active_symbols(NUM_MOST_ACTIVE_SYMBOLS)
+            symbols = fetch_most_active_symbols()
         except Exception as exc:
             raise HTTPException(503, f"Could not load the observed stocks: {exc}") from exc
     return {"symbols": symbols}

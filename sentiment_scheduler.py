@@ -113,7 +113,7 @@ def run_due_sentiment(db_path, now=None):
 
     from market_data import fetch_most_active_symbols
     from observed_universe import load_observed_symbols
-    symbols = load_observed_symbols(db_path) or fetch_most_active_symbols(50)
+    symbols = load_observed_symbols(db_path) or fetch_most_active_symbols(100)
     articles, fetch_errors = fetch_stock_articles(symbols, per_symbol=article_count, lookback_days=1)
     if not premarket:
         # Yahoo's first result for each ticker is the hourly headline considered.

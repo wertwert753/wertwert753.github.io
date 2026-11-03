@@ -185,7 +185,7 @@ class TradingService:
             balance, positions, orders = {}, [], []
 
         try:
-            symbols = fetch_most_active_symbols(50)
+            symbols = fetch_most_active_symbols()
             universe_ok = True
         except Exception as exc:
             universe_ok = False

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 
-def fetch_most_active_symbols(count=50) -> list[str]:
+def fetch_most_active_symbols(count=100) -> list[str]:
     """Return the Yahoo Finance Most Actives universe used by the dashboard."""
     try:
         import yfinance as yf
@@ -19,9 +19,9 @@ def fetch_most_active_symbols(count=50) -> list[str]:
             symbols.append(symbol)
         if len(symbols) == count:
             break
-    #if len(symbols) < count:
+    if len(symbols) < count:
         #raise RuntimeError(f"Yahoo returned only {len(symbols)} usable Most Actives symbols.")
-    #   print(f"Only {len(symbols)} symbols retrieved")
+        print(f"Only {len(symbols)} symbols retrieved")
     return symbols
 
 

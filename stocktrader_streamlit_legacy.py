@@ -15,6 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from globals import FIRST_TRADE
 from market_data import fetch_most_active_symbols, fetch_yfinance_delayed_closes, fetch_yfinance_ohlc
 from observed_universe import save_observed_symbols
 from sentiment_store import load_sentiment_snapshot, sentiment_priority
@@ -33,7 +34,6 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "trading_dashboard.sqlite3"
 TERMINAL_ORDER_STATES = {"filled", "cancelled", "canceled", "rejected", "expired"}
 INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
-FIRST_TRADE = True # first trade flag
 
 st.set_page_config(page_title="StockTrader", page_icon="📈", layout="wide")
 st.title("StockTrader")
@@ -233,13 +233,21 @@ def apply_sandbox_sim_signal(account_key, symbol, signal_time, signal, price,
                 action = "SIM_OPEN_LONG" if qty > 0 else "SIM_OPEN_SHORT"
                 db.execute("INSERT INTO sandbox_sim_positions(account_key,symbol,quantity,average_price,last_price,opened_at) VALUES(?,?,?,?,?,?)",
                            (account_key, symbol, qty, avg, last, now))
-        elif (qty > 0 and signal == "SELL") or (qty < 0 and signal == "BUY"):
-            trade_qty = abs(qty)
-            realized = qty * (float(price) - avg)
-            action = "SIM_CLOSE_LONG" if qty > 0 else "SIM_CLOSE_SHORT"
-            db.execute("DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?", (account_key, symbol))
         else:
-            trade_qty = abs(qty)
+            # A reversal is an exit in the simulator, never an automatic flip:
+            # SELL closes an existing long; BUY closes an existing short.
+            is_contrarian_exit = (qty > 0 and signal == "SELL") or (qty < 0 and signal == "BUY")
+            if is_contrarian_exit:
+                trade_qty = abs(qty)
+                realized = qty * (float(price) - avg)
+                action = "SIM_CLOSE_LONG" if qty > 0 else "SIM_CLOSE_SHORT"
+                db.execute(
+                    "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
+                    (account_key, symbol),
+                )
+            else:
+                # Repeated same-direction signals do not pyramid an open position.
+                trade_qty = abs(qty)
         db.execute("INSERT OR IGNORE INTO sandbox_sim_trades(account_key,trading_day,symbol,signal_time,signal,action,quantity,price,realized_pnl,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                    (account_key, trading_day, symbol, signal_time, signal, action, trade_qty,
                     float(price), float(realized), now))
@@ -362,7 +370,7 @@ def active_orders_by_symbol(orders):
         if str(order.get("status", "")).lower() in TERMINAL_ORDER_STATES:
             continue
         for leg in order.get("legs", []) or []:
-            if leg.get("instrument-type", "Equity").lower() == "equity":
+            if str(leg.get("instrument-type", "Equity")).lower() in ("equity", "stock"):
                 result.add(str(leg.get("symbol", "")).upper())
     return result
 
@@ -372,22 +380,20 @@ def in_regular_session():
     return now.weekday() < 5 and wall_time(9, 30) <= now.time().replace(tzinfo=None) < wall_time(16, 0)
 
 
-def in_preclose_window(now_pt=None):
-    """Closeout window: 12:45–1:00 p.m. Pacific."""
+def in_entry_cutoff_window(now_pt=None):
+    """Stop opening new positions 20 minutes before the 1:00 p.m. PT close."""
     now = now_pt or datetime.now(PT)
-
-    # Ensure Pacific timezone
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=PT)
-    else:
-        now = now.astimezone(PT)
-
+    now = now.replace(tzinfo=PT) if now.tzinfo is None else now.astimezone(PT)
     local_time = now.time().replace(tzinfo=None)
+    return now.weekday() < 5 and wall_time(12, 40) <= local_time < wall_time(13, 0)
 
-    return (
-        now.weekday() < 5
-        and wall_time(12, 45) <= local_time < wall_time(13, 0)
-    )
+
+def in_preclose_window(now_pt=None):
+    """Attempt position liquidation repeatedly from 12:45 until 1:00 p.m. PT."""
+    now = now_pt or datetime.now(PT)
+    now = now.replace(tzinfo=PT) if now.tzinfo is None else now.astimezone(PT)
+    local_time = now.time().replace(tzinfo=None)
+    return now.weekday() < 5 and wall_time(12, 45) <= local_time < wall_time(13, 0)
 
 def in_beginning_window(now_pt=None):
     """Closeout window: 12:45–1:00 p.m. Pacific."""
@@ -468,23 +474,47 @@ def render_equity_history(history, value_column, title, widget_key):
     st.plotly_chart(fig, use_container_width=True)
 
 def get_last_signal(df):
-    buy_signals = df[df['buy_signal'] == True]
-    sell_signals = df[df['sell_signal'] == True]
-    if len(buy_signals) == 0 and len(sell_signals) == 0:
-        raise Exception('No Signals')
-    if len(buy_signals) == 0:
-        last_sell = sell_signals.index[-1]
-        loc = df.index.get_loc(last_sell)
-        return 'SELL', loc
-    if len(sell_signals) == 0:
-        last_buy = buy_signals.index[-1]
-        loc = df.index.get_loc(last_buy)
-        return 'BUY', loc
-    last_buy = buy_signals.index[-1]
-    last_sell = sell_signals.index[-1]
-    sell_loc = df.index.get_loc(last_sell)
-    buy_loc = df.index.get_loc(last_buy)
-    return 'BUY', buy_loc if last_buy > last_sell else 'SELL', sell_loc
+    """Return the most recent completed HalfTrend reversal as (signal, row location)."""
+    buy_locs = [i for i, value in enumerate(df["buy_signal"].fillna(False)) if bool(value)]
+    sell_locs = [i for i, value in enumerate(df["sell_signal"].fillna(False)) if bool(value)]
+    candidates = [(buy_locs[-1], "BUY") for _ in [0] if buy_locs]
+    candidates += [(sell_locs[-1], "SELL") for _ in [0] if sell_locs]
+    if not candidates:
+        return "HOLD", max(0, len(df) - 1)
+    loc, signal = max(candidates, key=lambda item: item[0])
+    return signal, loc
+
+
+def get_previous_day_last_signal(df, current_pt_date):
+    """Return the last BUY/SELL reversal from any earlier Pacific trading date."""
+    if df is None or df.empty:
+        return "HOLD", None
+    for loc in range(len(df) - 1, -1, -1):
+        timestamp = pd.Timestamp(df.index[loc])
+        if timestamp.tzinfo is None:
+            # Yahoo intraday indexes are normally timezone-aware. Treat a naive
+            # index as Pacific-local so the date boundary remains deterministic.
+            timestamp = timestamp.tz_localize(PT)
+        else:
+            timestamp = timestamp.tz_convert(PT)
+        if timestamp.date() >= current_pt_date:
+            continue
+        row = df.iloc[loc]
+        if bool(row.get("buy_signal", False)):
+            return "BUY", loc
+        if bool(row.get("sell_signal", False)):
+            return "SELL", loc
+    return "HOLD", None
+
+
+def is_current_pacific_trading_date(signal_time, current_pt_date):
+    """Check whether a candle timestamp belongs to today's Pacific session."""
+    timestamp = pd.Timestamp(signal_time)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(PT)
+    else:
+        timestamp = timestamp.tz_convert(PT)
+    return timestamp.date() == current_pt_date
 
 init_db()
 
@@ -497,7 +527,7 @@ with st.sidebar:
     sandbox_sim_starting_capital = 500.0
     sandbox_sim_allocation_pct = 20
     if not production:
-        st.info("Sandbox mode runs a local virtual portfolio using Yahoo prices. Positions close at 12:45 p.m. Pacific each trading day. No tastytrade sandbox orders or account values are used.")
+        st.info("Sandbox mode runs a local virtual portfolio using Yahoo prices. New entries stop at 12:40 p.m. Pacific and virtual positions close at 12:45 p.m. Pacific. No tastytrade orders or account values are used.")
         st.subheader("Sandbox P&L simulation")
         sandbox_sim_starting_capital = st.number_input(
             "Virtual starting capital ($)", min_value=100.0, max_value=1000000.0,
@@ -525,10 +555,14 @@ with st.sidebar:
     amplitude = st.number_input("HalfTrend amplitude", min_value=1, max_value=10, value=2)
     channel_deviation = st.number_input("ATR channel deviation", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
     st.caption("Signals and Sandbox simulator prices use Yahoo Finance candles. Production orders use tastytrade quotes.")
+    if production:
+        st.caption("At the start of each Pacific trading day, Production processes each symbol's last BUY/SELL signal from the prior available trading day before today's signals. Real orders still require enabled automation and all production risk checks.")
     st.divider()
     arm_requested = False
     production_ack = False
     live_phrase = ""
+    eod_liquidation_requested = False
+    eod_liquidation_authorized = False
     start_clicked = stop_clicked = False
     if production:
         st.header("Order limits")
@@ -539,10 +573,19 @@ with st.sidebar:
         daily_loss_pct = st.number_input("Pause new entries after daily loss (%)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
         st.divider()
         st.header("Automation")
-        st.caption("With automation enabled, open equity positions are scheduled to close at 12:45 p.m. Pacific each trading day.")
+        st.caption("New entries stop at 12:40 p.m. Pacific. End-of-day liquidation attempts run from 12:45 to 1:00 p.m. Pacific and require the separate EOD authorization or normal automation. Keep this app session running; this is not an external scheduler.")
         arm_requested = st.checkbox("Allow automatic orders after Start", value=False)
         production_ack = st.checkbox("I understand this sends real orders to my production account.", value=False)
         live_phrase = st.text_input("Type ENABLE LIVE TRADING", type="password")
+        eod_liquidation_requested = st.checkbox(
+            "Authorize automatic end-of-day liquidation even when entry automation is stopped",
+            value=False,
+            help="Requires the production acknowledgement and exact confirmation phrase above."
+        )
+        eod_liquidation_authorized = bool(
+            eod_liquidation_requested and production_ack
+            and live_phrase == "ENABLE LIVE TRADING"
+        )
         start_clicked = st.button("Start automation")
         stop_clicked = st.button("Stop automation")
     else:
@@ -617,8 +660,9 @@ if production and client and account_rows:
         index=next((i for i, row in enumerate(account_rows) if row[0] == st.session_state.tt_account), 0))
     st.session_state.tt_account = account_rows[labels.index(selected_label)][0]
 
-@st.fragment(run_every="15s")
+@st.fragment(run_every="30s")
 def render_dashboard():
+    global FIRST_TRADE
     active_client = st.session_state.tt_client
     account_number = st.session_state.tt_account
     sandbox_mode = environment == "Sandbox"
@@ -637,8 +681,209 @@ def render_dashboard():
     else:
         balance, position_items, orders = {}, [], []
 
+
+    # Manual liquidation is deliberately independent of Yahoo screener/candle
+    # retrieval and HalfTrend signal processing.
+    st.divider()
+    st.subheader("Manual position management")
+    if sandbox_mode:
+        st.caption("Closes every position in the persistent local Sandbox simulator. No broker orders are sent.")
+        confirm_manual_close = st.checkbox(
+            "I confirm: close every open Sandbox simulated position",
+            key="confirm_manual_close_sandbox",
+        )
+        if st.button("Close all positions now", key="manual_close_all_sandbox",
+                     type="primary", disabled=not confirm_manual_close):
+            sim_key = sandbox_simulator_key()
+            sim_positions, _, _, _ = sandbox_sim_snapshot(
+                sim_key, sandbox_sim_starting_capital
+            )
+            closed, failed = [], []
+            close_time = datetime.now(PT)
+            for symbol, position in sim_positions.items():
+                price = float(position.get("last_price") or 0.0)
+                if price <= 0:
+                    failed.append(f"{symbol}: no valid recorded price")
+                    continue
+                try:
+                    if close_sandbox_sim_position(sim_key, symbol, price, close_time):
+                        closed.append(symbol)
+                    else:
+                        failed.append(f"{symbol}: position was not closed")
+                except Exception as exc:
+                    failed.append(f"{symbol}: {str(exc)[:180]}")
+            if closed:
+                st.success("Closed Sandbox positions: " + ", ".join(closed))
+            if failed:
+                st.error("Sandbox close failures: " + "; ".join(failed))
+            if not sim_positions:
+                st.info("There were no open Sandbox positions.")
+
+    else:
+        st.caption(
+            "Submits real tastytrade closing orders for supported equity positions. "
+            "Options and other non-equity positions are reported but are not closed by this equity application."
+        )
+        production_manual_authorized = bool(
+            active_client and account_number
+            and st.session_state.tt_environment == "Production"
+            and getattr(active_client, "is_production", False)
+            and production_ack and live_phrase == "ENABLE LIVE TRADING"
+        )
+        confirm_manual_close = st.checkbox(
+            "I understand this will submit real closing orders for this Production account",
+            key="confirm_manual_close_production",
+        )
+        if st.button(
+            "Close all positions now",
+            key="manual_close_all_production",
+            type="primary",
+            disabled=not (production_manual_authorized and confirm_manual_close),
+        ):
+            manual_closed, manual_pending, manual_failed = [], [], []
+            try:
+                fresh_positions = [
+                    p for p in active_client.get_positions(account_number)
+                    if isinstance(p, dict) and signed_quantity(p) != 0
+                ]
+                fresh_orders = active_client.get_orders(account_number)
+                working_by_symbol = active_orders_by_symbol(fresh_orders)
+
+                # Cancel working orders first. Never race a still-working order
+                # with a second closing order for the same symbol.
+                for order_item in fresh_orders:
+                    live_order = order_item.get("order", order_item) if isinstance(order_item, dict) else {}
+                    if str(live_order.get("status", "")).lower() in TERMINAL_ORDER_STATES:
+                        continue
+                    order_symbols = {
+                        str(leg.get("symbol", "")).upper()
+                        for leg in (live_order.get("legs") or [])
+                        if str(leg.get("instrument-type", "Equity")).lower() in ("equity", "stock")
+                    }
+                    if not order_symbols:
+                        continue
+                    order_id = live_order.get("id")
+                    if not order_id or not live_order.get("cancellable", True):
+                        manual_failed.append(
+                            f"{', '.join(sorted(order_symbols))}: working order cannot be cancelled safely"
+                        )
+                        continue
+                    try:
+                        active_client.cancel_order(account_number, order_id)
+                    except Exception as exc:
+                        manual_failed.append(
+                            f"{', '.join(sorted(order_symbols))}: cancellation failed ({str(exc)[:160]})"
+                        )
+
+                # Re-read working orders after cancellation requests. If a
+                # cancellation is still pending, defer that symbol to avoid
+                # accidentally reversing or over-closing the position.
+                fresh_orders = active_client.get_orders(account_number)
+                working_by_symbol = active_orders_by_symbol(fresh_orders)
+                equity_positions = []
+                for position in fresh_positions:
+                    symbol = str(position.get("underlying-symbol", position.get("symbol", ""))).upper()
+                    instrument_symbol = str(position.get("symbol", symbol)).upper()
+                    instrument_type = str(position.get("instrument-type", "Equity")).lower()
+                    if instrument_type not in ("equity", "stock") or instrument_symbol != symbol:
+                        manual_failed.append(f"{symbol or 'UNKNOWN'}: unsupported non-equity position")
+                        continue
+                    if symbol in working_by_symbol:
+                        manual_pending.append(symbol)
+                        continue
+                    equity_positions.append((symbol, position, signed_quantity(position)))
+
+                quote_map_manual = {}
+                symbols_to_quote = [symbol for symbol, _, _ in equity_positions]
+                if symbols_to_quote:
+                    try:
+                        quote_map_manual = broker_quotes(active_client, symbols_to_quote)
+                    except Exception as exc:
+                        manual_failed.append(f"Broker quote retrieval failed: {str(exc)[:180]}")
+
+                for symbol, position, signed_qty in equity_positions:
+                    if symbol in working_by_symbol:
+                        continue
+                    quantity = abs(float(signed_qty))
+                    if quantity <= 0:
+                        continue
+                    quote = quote_map_manual.get(symbol, {})
+                    reference_price = numeric(
+                        quote, "mark", "mid", "last", "bid", "ask",
+                        default=numeric(position, "mark", "mark-price", "close-price", "average-open-price"),
+                    )
+                    if reference_price <= 0:
+                        manual_failed.append(f"{symbol}: no usable reference price")
+                        continue
+                    action = "Sell to Close" if signed_qty > 0 else "Buy to Close"
+                    order = None
+                    try:
+                        if not math.isclose(quantity, round(quantity), abs_tol=1e-6):
+                            if signed_qty < 0:
+                                raise ValueError("Fractional short closing is unsupported.")
+                            definition = payload_data(active_client.get_equity(symbol))
+                            if not definition.get("is-fractional-quantity-eligible"):
+                                raise ValueError("Broker does not mark this equity as fractional-eligible.")
+                            order = TastytradeClient.build_equity_order(
+                                symbol, action, quantity, reference_price,
+                                source="StockTrader/Manual-Close-All", allow_fractional=True,
+                            )
+                        else:
+                            order = TastytradeClient.build_equity_market_close(
+                                symbol, action, int(round(quantity)),
+                                source="StockTrader/Manual-Close-All",
+                            )
+                        preview = active_client.dry_run_order(account_number, order)
+                        preview_data = payload_data(preview)
+                        errors = preview_data.get("errors", []) if isinstance(preview_data, dict) else []
+                        warnings = preview_data.get("warnings", []) if isinstance(preview_data, dict) else []
+                        if errors or warnings:
+                            raise TastytradeAPIError(
+                                f"Broker preflight blocked order: errors={errors}, warnings={warnings}"
+                            )
+                        result = active_client.submit_order(
+                            account_number, order, confirm_live=True,
+                            max_order_notional=quantity * reference_price,
+                            risk_reference_price=(
+                                reference_price if order.get("order-type") == "Market" else None
+                            ),
+                        )
+                        manual_closed.append(
+                            f"{symbol} ({action} {quantity:g}; submitted, fill not yet confirmed)"
+                        )
+                    except Exception as exc:
+                        manual_failed.append(f"{symbol}: {str(exc)[:220]}")
+
+                # Refresh broker state so the UI distinguishes submitted orders
+                # from positions the broker has actually removed.
+                verify_positions = active_client.get_positions(account_number)
+                verify_orders = active_client.get_orders(account_number)
+                still_open = [
+                    f"{str(p.get('underlying-symbol', p.get('symbol', 'UNKNOWN'))).upper()} "
+                    f"({signed_quantity(p):g})"
+                    for p in verify_positions
+                    if isinstance(p, dict) and signed_quantity(p) != 0
+                ]
+                if manual_closed:
+                    st.success("Closing orders submitted: " + "; ".join(manual_closed))
+                if manual_pending:
+                    st.warning("Waiting for existing orders to cancel: " + ", ".join(sorted(set(manual_pending))))
+                if manual_failed:
+                    st.error("Close-all issues: " + "; ".join(manual_failed))
+                if not still_open and not active_orders_by_symbol(verify_orders):
+                    st.success("Broker verification: no open positions or working equity orders remain.")
+                else:
+                    if still_open:
+                        st.warning("Positions still reported by broker: " + ", ".join(still_open))
+                    remaining_working = sorted(active_orders_by_symbol(verify_orders))
+                    if remaining_working:
+                        st.warning("Working equity orders still present: " + ", ".join(remaining_working))
+                    st.caption("A submitted order is not a confirmed fill. Check the broker account until it reports flat.")
+            except Exception as exc:
+                st.error(f"Manual close-all operation failed: {exc}")
+
     try:
-        symbols = fetch_most_active_symbols(50)
+        symbols = fetch_most_active_symbols()
         universe_ok = True
     except Exception as exc:
         st.error(f"Could not refresh Yahoo Most Actives: {exc}")
@@ -673,6 +918,8 @@ def render_dashboard():
     usable_frames = {}
     signal_by_symbol = {}
     last_signal_by_symbol = {}
+    simulator_opening_signal_by_symbol = {}
+    production_opening_signal_by_symbol = {}
     sentiment_by_symbol = load_sentiment_snapshot(DB_PATH, max_age_hours=24)
     now_utc = pd.Timestamp.now(tz="UTC")
     interval_mins = INTERVAL_MINUTES[interval]
@@ -690,18 +937,37 @@ def render_dashboard():
             end_of_bar, age = bar_freshness(frame, interval)
         indicators[symbol] = indicator
         usable_frames[symbol] = frame
-        print("First Trade Prior")
         if FIRST_TRADE and in_beginning_window():
-            print("First Trade Imminent")
             signal, loc = get_last_signal(indicator)
-            row = indicator.iloc[loc]
-            bar_time = str(indicator.index[loc])
             FIRST_TRADE = False
         else:
-            loc = -1
-            bar_time = str(indicator.index[loc])
+            loc = len(indicator) - 1
+            row = indicator.iloc[loc]
             signal = "BUY" if bool(row.buy_signal) else ("SELL" if bool(row.sell_signal) else "HOLD")
+        row = indicator.iloc[loc]
+        bar_time = str(indicator.index[loc])
         signal_by_symbol[symbol] = (signal, bar_time, float(frame.iloc[loc].Close), age)
+        # The simulator starts each Pacific trading day with the prior
+        # available trading day's final HalfTrend direction. This is kept
+        # separate from the live-broker signal stream.
+        previous_signal, previous_loc = get_previous_day_last_signal(
+            indicator, datetime.now(PT).date()
+        )
+        if previous_signal in ("BUY", "SELL") and previous_loc is not None:
+            previous_time = str(indicator.index[previous_loc])
+            previous_close = float(frame.iloc[previous_loc].Close)
+            simulator_opening_signal_by_symbol[symbol] = (
+                previous_signal,
+                f"SIM_DAY_OPEN:{datetime.now(PT).date().isoformat()}:{previous_time}",
+                previous_close,
+                age,
+            )
+            production_opening_signal_by_symbol[symbol] = (
+                previous_signal,
+                f"PROD_DAY_OPEN:{datetime.now(PT).date().isoformat()}:{previous_time}",
+                previous_close,
+                age,
+            )
         measured = sentiment_by_symbol.get(symbol, {})
         priority = sentiment_priority(signal, measured)
         priority_label = ("No signal" if signal == "HOLD" else
@@ -816,7 +1082,9 @@ def render_dashboard():
 
         event_account_key = sandbox_simulator_key() if sandbox_mode else f"{environment}:{account_number}"
         now_pt = datetime.now(PT)
-        eod_closeout_window = in_preclose_window()
+        entry_cutoff_window = in_entry_cutoff_window(now_pt)
+        eod_closeout_window = in_preclose_window(now_pt)
+        closeout_authorized = bool(st.session_state.auto_enabled or eod_liquidation_authorized)
         sim_price_map = {}
         if sandbox_mode:
             for symbol in set(quote_map) | set(usable_frames):
@@ -832,15 +1100,32 @@ def render_dashboard():
                 for symbol, sim_position in sim_positions.items():
                     close_price = sim_price_map.get(symbol, sim_position["last_price"])
                     close_sandbox_sim_position(event_account_key, symbol, close_price, now_pt)
-            elif in_regular_session():
-                ordered_signals = sorted(
-                    signal_by_symbol.items(),
+            elif in_regular_session() and not entry_cutoff_window:
+                # Process the carried-forward opening direction first, then any
+                # fresh signal generated today. The synthetic daily event key
+                # makes the opening decision idempotent across Streamlit reruns.
+                opening_items = list(simulator_opening_signal_by_symbol.items())
+                current_pt_date = datetime.now(PT).date()
+                current_items = [
+                    item for item in signal_by_symbol.items()
+                    if is_current_pacific_trading_date(item[1][1], current_pt_date)
+                ]
+                ordered_signals = opening_items + sorted(
+                    current_items,
                     key=lambda item: sentiment_priority(item[1][0], sentiment_by_symbol.get(item[0])),
                     reverse=True,
                 )
+                seen_events = set()
                 for symbol, (signal, signal_time, signal_close, _) in ordered_signals:
                     if signal not in ("BUY", "SELL"):
                         continue
+                    event_key = (symbol, signal_time, signal)
+                    if event_key in seen_events:
+                        continue
+                    seen_events.add(event_key)
+                    # The opening event uses the prior trading day's last
+                    # direction. A fresh current-day reversal is processed after
+                    # it and can close the carried-forward position.
                     quote = quote_map.get(symbol, {})
                     side_key = "ask" if signal == "BUY" else "bid"
                     fill_price = numeric(quote, side_key)
@@ -914,28 +1199,72 @@ def render_dashboard():
         # Record every signal for audit. Submit only after explicit Start and all safety checks pass.
         active_symbols = active_orders_by_symbol(orders)
         regular_session = in_regular_session()
-        ordered_signals = sorted(
-            signal_by_symbol.items(),
-            key=lambda item: sentiment_priority(item[1][0], sentiment_by_symbol.get(item[0])),
+        current_pt_date = datetime.now(PT).date()
+        # In Production, process the prior trading day's final direction first.
+        # The synthetic daily key makes this opening event idempotent across reruns.
+        production_opening_items = [
+            (symbol, values, True)
+            for symbol, values in production_opening_signal_by_symbol.items()
+        ]
+        current_production_items = [
+            (symbol, values, False)
+            for symbol, values in signal_by_symbol.items()
+            if is_current_pacific_trading_date(values[1], current_pt_date)
+        ]
+        current_production_items.sort(
+            key=lambda item: sentiment_priority(
+                item[1][0], sentiment_by_symbol.get(item[0])
+            ),
             reverse=True,
         )
-        for symbol, (signal, signal_time, signal_close, age) in ordered_signals:
+        ordered_signals = production_opening_items + current_production_items
+        opening_pending_symbols = set()
+        for symbol, (signal, signal_time, signal_close, age), is_opening_signal in ordered_signals:
             if sandbox_mode:
+                continue
+            # Do not let a fresh same-refresh signal race the opening order.
+            # Once the opening event is submitted/uncertain, the next broker
+            # refresh can process today's reversal against refreshed positions.
+            if not is_opening_signal and symbol in opening_pending_symbols:
                 continue
             if signal not in ("BUY", "SELL"):
                 continue
-            if has_event(event_account_key, symbol, signal_time, signal):
+            prior_event = get_event(event_account_key, symbol, signal_time, signal)
+            if is_opening_signal:
+                if prior_event and prior_event[0] in {
+                    "Submitted", "Preflight", "Order error / check broker", "Skipped"
+                }:
+                    # Already attempted or found unnecessary today; let any
+                    # current-day reversal run against the refreshed position.
+                    continue
+                opening_pending_symbols.add(symbol)
+            # A monitor-only/blocked event must remain eligible when automation is
+            # subsequently enabled or when a transient condition clears. Submitted
+            # and uncertain outcomes are held to prevent duplicate broker orders.
+            if prior_event and prior_event[0] in {
+                "Submitted", "Preflight", "Order error / check broker"
+            }:
                 continue
+
             action, quantity, limit_price = None, 0, 0.0
             order = None
             external_id = f"ht-{uuid.uuid4().hex[:20]}"
             status = "Observed · monitor only"
             details = "No order submitted."
-            update_event(event_account_key, symbol, signal_time, signal, status, details, external_id)
             if not st.session_state.auto_enabled:
+                update_event(event_account_key, symbol, signal_time, signal, status, details, external_id)
                 continue
-            if eod_closeout_window:
-                status, details = "Skipped", "New entries are paused during the 12:45 p.m. Pacific closeout window."
+
+            position_state = positions_by_symbol.get(symbol)
+            current_qty = position_state["qty"] if position_state else 0
+            contrarian_signal, loc = get_last_signal(indicator)
+            is_contrarian_exit = (
+                (contrarian_signal == "BUY" and current_qty < 0)
+                or (contrarian_signal == "SELL" and current_qty > 0)
+            )
+
+            if entry_cutoff_window:
+                status, details = "Skipped", "New entries are paused from 12:40 p.m. Pacific ahead of end-of-day liquidation."
             elif not universe_ok and symbol not in held:
                 status, details = "Blocked", "Most Actives list did not refresh; automatic entries disabled."
             elif not regular_session:
@@ -944,16 +1273,47 @@ def render_dashboard():
                 status, details = "Blocked", f"Yahoo candle is stale ({age:.0f}s old)."
             elif symbol not in quote_map or (not str(quote_map.get(symbol, {}).get("quote-source", "")).startswith("Yahoo") and not fresh_quote(quote_map.get(symbol))):
                 status, details = "Blocked", "No sufficiently fresh quote or delayed candle close."
+            elif symbol in active_symbols and is_contrarian_exit:
+                # Cancel conflicting working orders first. Do not submit the exit
+                # until a later broker refresh confirms the symbol is no longer
+                # working; this avoids racing a still-live order and over-closing.
+                cancel_errors = []
+                cancelled_any = False
+                for order_item in orders:
+                    live_order = order_item.get("order", order_item) if isinstance(order_item, dict) else {}
+                    order_status = str(live_order.get("status", "")).lower()
+                    if order_status in TERMINAL_ORDER_STATES:
+                        continue
+                    order_symbols = {
+                        str(leg.get("symbol", "")).upper()
+                        for leg in (live_order.get("legs") or [])
+                        if str(leg.get("instrument-type", "Equity")).lower() in ("equity", "stock")
+                    }
+                    if symbol not in order_symbols:
+                        continue
+                    order_id = live_order.get("id")
+                    if not live_order.get("cancellable", True) or not order_id:
+                        cancel_errors.append("working order cannot be safely cancelled")
+                        continue
+                    try:
+                        active_client.cancel_order(account_number, order_id)
+                        cancelled_any = True
+                    except Exception as exc:
+                        cancel_errors.append(str(exc)[:160])
+                status = "Exit pending cancellation"
+                details = (
+                    "Contrarian HalfTrend signal detected. Conflicting working order cancellation "
+                    + ("requested; exit will be retried after broker refresh." if cancelled_any else "could not be confirmed.")
+                    + (f" Details: {'; '.join(cancel_errors)}" if cancel_errors else "")
+                )
             elif symbol in active_symbols:
                 status, details = "Blocked", "An open tastytrade order already exists for this symbol."
-            elif signal in ("BUY", "SELL") and day_loss_block and (not positions_by_symbol.get(symbol) or positions_by_symbol[symbol]["qty"] == 0):
-                status, details = "Blocked", "Daily loss limit pauses new long and short entries."
+            elif signal in ("BUY", "SELL") and day_loss_block and not is_contrarian_exit:
+                status, details = "Blocked", "Daily loss limit pauses new entries; contrarian exits remain enabled."
             else:
                 quote = quote_map[symbol]
                 bid, ask = numeric(quote, "bid"), numeric(quote, "ask")
                 quote_source = quote.get("quote-source", "tastytrade")
-                position_state = positions_by_symbol.get(symbol)
-                current_qty = position_state["qty"] if position_state else 0
                 fractional_order = False
                 if active_client.is_production:
                     try:
@@ -967,7 +1327,7 @@ def render_dashboard():
                         status, details = "Blocked", "Quote prices are unavailable or invalid."
                     elif current_qty > 0:
                         status, details = "Skipped", "Long position already exists; no additional shares will be added."
-                    elif not str(quote.get("quote-source", "")).startswith("Yahoo") and abs(ask - signal_close) / signal_close * 100 > max_gap_pct:
+                    elif current_qty < 0 and not str(quote.get("quote-source", "")).startswith("Yahoo") and abs(ask - signal_close) / signal_close * 100 > max_gap_pct:
                         status, details = "Blocked", "Live ask is too far from the Yahoo signal close."
                     elif current_qty < 0:
                         action, quantity, limit_price = "Buy to Close", math.floor(abs(current_qty)), round(ask, 2)
@@ -991,7 +1351,7 @@ def render_dashboard():
                 else:
                     if not bid or not ask or ask < bid:
                         status, details = "Blocked", "Quote prices are unavailable or invalid."
-                    elif not str(quote.get("quote-source", "")).startswith("Yahoo") and abs(bid - signal_close) / signal_close * 100 > max_gap_pct:
+                    elif current_qty > 0 and not str(quote.get("quote-source", "")).startswith("Yahoo") and abs(bid - signal_close) / signal_close * 100 > max_gap_pct:
                         status, details = "Blocked", "Live bid is too far from the Yahoo signal close."
                     elif current_qty < 0:
                         status, details = "Skipped", "Short position already exists; no additional shares will be sold short."
@@ -1043,13 +1403,13 @@ def render_dashboard():
             update_event(event_account_key, symbol, signal_time, signal, status, details, external_id)
 
         if not sandbox_mode and eod_closeout_window:
-            if not st.session_state.auto_enabled:
+            if not closeout_authorized:
                 open_equities = [symbol for symbol, state in positions_by_symbol.items()
                                  if state["qty"] != 0
                                  and str(state["position"].get("instrument-type", "Equity")).lower() in ("equity", "stock")
                                  and str(state["position"].get("symbol", symbol)).upper() == symbol]
                 if open_equities or active_symbols:
-                    st.error("Production positions or working orders remain open, but automation is OFF. Enable authorized automation before the 12:45 p.m. Pacific closeout window.")
+                    st.error("Production positions or working orders remain open, but end-of-day liquidation is not authorized. Enable the separate EOD liquidation authorization (or normal automation) before 12:45 p.m. Pacific.")
                 else:
                     st.info("No open Production equity positions need closing right now.")
             else:
@@ -1101,14 +1461,12 @@ def render_dashboard():
                             close_failures.append(f"{symbol}: prior close submission outcome is unconfirmed; check broker orders")
                             continue
                         broker_status = str(prior_order.get("status", "")).lower()
-                        if broker_status in TERMINAL_ORDER_STATES:
-                            if broker_status in ("filled", "complete", "completed"):
-                                continue
-                            # A terminal rejected/cancelled/expired order may be retried
-                            # against the current position snapshot.
-                        else:
+                        if broker_status not in TERMINAL_ORDER_STATES and broker_status not in ("complete", "completed"):
                             close_pending.append(symbol)
                             continue
+                        # Terminal filled/cancelled/rejected orders are reconciled
+                        # against the current broker position quantity above. If a
+                        # residual quantity remains, submit a close for that remainder.
                     quantity = round(abs(qty), 4)
                     if quantity <= 0:
                         close_failures.append(f"{symbol}: position quantity is too small to close")
@@ -1168,7 +1526,7 @@ def render_dashboard():
                     st.info("No open Production equity positions need closing right now.")
 
         # Refresh account view after any automatic submission.
-        if not sandbox_mode and st.session_state.auto_enabled:
+        if not sandbox_mode and (st.session_state.auto_enabled or (eod_closeout_window and eod_liquidation_authorized)):
             try:
                 balances_response = active_client.get_balances(account_number)
                 balance = payload_data(balances_response)
@@ -1176,12 +1534,34 @@ def render_dashboard():
                     balance = balance["balances"]
                 positions = active_client.get_positions(account_number)
                 position_items = [p for p in positions if isinstance(p, dict)]
+                orders = active_client.get_orders(account_number)
                 nlv = numeric(balance, "net-liquidating-value", "net_liquidating_value")
                 cash = numeric(balance, "cash-balance", "cash_balance")
                 if nlv:
                     persist_equity(event_account_key, nlv, cash)
             except Exception as exc:
                 st.warning(f"Order-refresh snapshot unavailable: {exc}")
+
+        if not sandbox_mode and eod_closeout_window and closeout_authorized:
+            remaining_positions = []
+            for position in position_items:
+                remaining_qty = signed_quantity(position)
+                if remaining_qty == 0:
+                    continue
+                symbol = str(position.get("underlying-symbol", position.get("symbol", "UNKNOWN"))).upper()
+                instrument_type = str(position.get("instrument-type", "Equity")).lower()
+                remaining_positions.append(
+                    f"{symbol} ({remaining_qty:g}; {instrument_type})"
+                )
+            remaining_working = sorted(active_orders_by_symbol(orders))
+            if not remaining_positions and not remaining_working:
+                st.success("Broker verification: no open positions or working equity orders remain in the account snapshot.")
+            else:
+                if remaining_positions:
+                    st.error("Broker verification: positions still open: " + ", ".join(remaining_positions))
+                if remaining_working:
+                    st.warning("Broker verification: working equity orders still present: " + ", ".join(remaining_working))
+                st.caption("The account is not confirmed flat. Keep the app running and check the broker directly; order submission is not proof of execution.")
 
         if not sandbox_mode and portfolio_rows:
             st.subheader("Current holdings")

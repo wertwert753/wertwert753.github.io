@@ -25,7 +25,7 @@ st.caption("FinBERT-measured tone in recent Yahoo Finance articles for the stock
 @st.cache_data(ttl=300, show_spinner=False)
 def observed_universe():
     symbols = load_observed_symbols(APP_DIR / "trading_dashboard.sqlite3")
-    return symbols or fetch_most_active_symbols(50)
+    return symbols or fetch_most_active_symbols(100)
 
 
 try:
