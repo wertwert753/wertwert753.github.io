@@ -588,6 +588,7 @@ with st.sidebar:
         )
         start_clicked = st.button("Start automation")
         stop_clicked = st.button("Stop automation")
+        close_positions = st.button("Close All Positions")
     else:
         allocation_pct = 5
         max_portfolio_pct = 50
@@ -681,7 +682,6 @@ def render_dashboard():
     else:
         balance, position_items, orders = {}, [], []
 
-
     # Manual liquidation is deliberately independent of Yahoo screener/candle
     # retrieval and HalfTrend signal processing.
     st.divider()
@@ -693,7 +693,7 @@ def render_dashboard():
             key="confirm_manual_close_sandbox",
         )
         if st.button("Close all positions now", key="manual_close_all_sandbox",
-                     type="primary", disabled=not confirm_manual_close):
+                        type="primary", disabled=not confirm_manual_close):
             sim_key = sandbox_simulator_key()
             sim_positions, _, _, _ = sandbox_sim_snapshot(
                 sim_key, sandbox_sim_starting_capital
