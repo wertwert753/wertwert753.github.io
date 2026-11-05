@@ -4,10 +4,11 @@ A local FastAPI application for Yahoo Finance HalfTrend candles, tastytrade acco
 
 ## Run
 
-On Windows, start StockTrader with the project launcher. It uses the project's virtual environment and installs missing dependencies there before starting the web server:
+Install dependencies and start StockTrader from the project directory:
 
 ```powershell
-.\run_stocktrader.bat
+python -m pip install -r requirements.txt
+python stocktrader.py
 ```
 
 StockTrader listens on all network interfaces at port `8765` by default and does not require a username or password. The host computer has full controls at `http://127.0.0.1:8765`; other computers can view the dashboard but cannot change settings, run sentiment analysis, or control trading. Use the host computer's LAN address, such as `http://192.168.1.25:8765`, from another device. The host firewall must allow inbound connections on a trusted network. Do not expose the trading service to the public internet.

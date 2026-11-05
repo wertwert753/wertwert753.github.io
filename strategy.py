@@ -119,7 +119,7 @@ def crossover_signals(candles: pd.DataFrame | pd.Series, amplitude: int = 2,
     df["buy_signal"] = pd.notna(df["arrowUp"])
     df["sell_signal"] = pd.notna(df["arrowDown"])
     df["signal"] = np.select([df["buy_signal"], df["sell_signal"]], ["BUY", "SELL"], default="")
-    # Lower-case close alias keeps the Streamlit signal table compatible with OHLC input.
+    # Lower-case close alias keeps the signal table compatible with OHLC input.
     df["close"] = close.to_numpy()
     return df
 

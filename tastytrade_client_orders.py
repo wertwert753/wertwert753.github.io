@@ -21,7 +21,7 @@ class TastytradeAPIError(RuntimeError):
 
 class TastytradeClient:
     def __init__(self, client_secret, refresh_token, client_id="", base_url=SANDBOX_URL,
-                 user_agent="TastyTraderBot/4.0", timeout=20):
+                 user_agent="StockTrader/1.0", timeout=20):
         if not client_secret or not refresh_token:
             raise ValueError("client_secret and refresh_token are required")
         if base_url not in (SANDBOX_URL, PRODUCTION_URL):
@@ -123,7 +123,7 @@ class TastytradeClient:
         return self._request("DELETE", f"/accounts/{account_number}/orders/{order_id}")
 
     @staticmethod
-    def build_equity_order(symbol, action, quantity, limit_price, source="TastyTraderBot-v4",
+    def build_equity_order(symbol, action, quantity, limit_price, source="StockTrader",
                            allow_fractional=False):
         symbol = str(symbol).strip().upper()
         if not symbol.isalnum() or not (1 <= len(symbol) <= 6):
@@ -140,7 +140,7 @@ class TastytradeClient:
             raise ValueError("Fractional quantities are limited to 4 decimals for long entries and exits.")
         if float(limit_price) <= 0:
             raise ValueError("Limit price must be positive.")
-        order_id = f"ttbot-{int(time.time())}-{uuid.uuid4().hex[:12]}"
+        order_id = f"stocktrader-{int(time.time())}-{uuid.uuid4().hex[:12]}"
         # tastytrade uses Notional Market orders for fractional eligible equities.
         # Use that order type for every eligible long entry/exit, even if the
         # calculated amount happens to equal a whole-share quantity.
