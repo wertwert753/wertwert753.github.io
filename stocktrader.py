@@ -106,6 +106,7 @@ async def update_settings(request: Controls, _local=Depends(is_local_request)):
         service.configure(request.settings)
         if service.settings["environment"] != previous_environment:
             snapshot = await asyncio.to_thread(service.refresh)
+            snapshot.environment
             return {"ok": True, "snapshot": snapshot}
     return {"ok": True}
 
