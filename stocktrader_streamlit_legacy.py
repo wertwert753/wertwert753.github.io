@@ -923,7 +923,10 @@ def render_dashboard():
     sentiment_by_symbol = load_sentiment_snapshot(DB_PATH, max_age_hours=24)
     now_utc = pd.Timestamp.now(tz="UTC")
     interval_mins = INTERVAL_MINUTES[interval]
+    count = 0
+    num_items = len(ohlc)
     for symbol, frame in ohlc.items():
+        count += 1
         if len(frame) < max(10, amplitude + 1):
             continue
         indicator = crossover_signals(frame, amplitude=int(amplitude), channel_deviation=float(channel_deviation))
@@ -939,7 +942,8 @@ def render_dashboard():
         usable_frames[symbol] = frame
         if FIRST_TRADE and in_beginning_window():
             signal, loc = get_last_signal(indicator)
-            FIRST_TRADE = False
+            if count == (num_items - 1):
+                FIRST_TRADE = False
         else:
             loc = len(indicator) - 1
             row = indicator.iloc[loc]
@@ -1100,7 +1104,7 @@ def render_dashboard():
                 for symbol, sim_position in sim_positions.items():
                     close_price = sim_price_map.get(symbol, sim_position["last_price"])
                     close_sandbox_sim_position(event_account_key, symbol, close_price, now_pt)
-            elif in_regular_session() and not entry_cutoff_window:
+            elif in_regular_session():
                 # Process the carried-forward opening direction first, then any
                 # fresh signal generated today. The synthetic daily event key
                 # makes the opening decision idempotent across Streamlit reruns.
@@ -1123,6 +1127,17 @@ def render_dashboard():
                     if event_key in seen_events:
                         continue
                     seen_events.add(event_key)
+                    # Exits remain enabled after the entry cutoff. The cutoff
+                    # blocks only signals that would create a new position.
+                    existing = sim_positions.get(symbol)
+                    existing_qty = float(existing["quantity"]) if existing else 0.0
+                    is_contrarian_exit = (
+                        (existing_qty > 0 and signal == "SELL")
+                        or (existing_qty < 0 and signal == "BUY")
+                    )
+                    if entry_cutoff_window and not is_contrarian_exit:
+                        continue
+
                     # The opening event uses the prior trading day's last
                     # direction. A fresh current-day reversal is processed after
                     # it and can close the carried-forward position.
@@ -1136,6 +1151,11 @@ def render_dashboard():
                     apply_sandbox_sim_signal(
                         event_account_key, symbol, signal_time, signal, fill_price,
                         sandbox_sim_starting_capital, sandbox_sim_allocation_pct,
+                    )
+                    # Refresh the local position snapshot so a later signal in
+                    # this same pass sees an opening/exit just processed.
+                    sim_positions, _, _, _ = sandbox_sim_snapshot(
+                        event_account_key, sandbox_sim_starting_capital
                     )
         if sandbox_mode:
             sim_positions, sim_realized, sim_unrealized, sim_equity = sandbox_sim_snapshot(
@@ -1251,19 +1271,26 @@ def render_dashboard():
             external_id = f"ht-{uuid.uuid4().hex[:20]}"
             status = "Observed · monitor only"
             details = "No order submitted."
-            if not st.session_state.auto_enabled:
-                update_event(event_account_key, symbol, signal_time, signal, status, details, external_id)
-                continue
 
             position_state = positions_by_symbol.get(symbol)
             current_qty = position_state["qty"] if position_state else 0
-            contrarian_signal, loc = get_last_signal(indicator)
+            # Use this symbol's signal from ordered_signals. `indicator` is
+            # overwritten while building the universe and may belong to another
+            # ticker, so get_last_signal(indicator) is not safe here.
             is_contrarian_exit = (
-                (contrarian_signal == "BUY" and current_qty < 0)
-                or (contrarian_signal == "SELL" and current_qty > 0)
+                (signal == "BUY" and current_qty < 0)
+                or (signal == "SELL" and current_qty > 0)
             )
 
-            if entry_cutoff_window:
+            # Production exits are still subject to the explicit live-trading
+            # authorization. When automation is off, record the signal only.
+            if not st.session_state.auto_enabled:
+                if is_contrarian_exit:
+                    details = "Contrarian exit detected but not submitted: Production automation is OFF."
+                update_event(event_account_key, symbol, signal_time, signal, status, details, external_id)
+                continue
+
+            if entry_cutoff_window and not is_contrarian_exit:
                 status, details = "Skipped", "New entries are paused from 12:40 p.m. Pacific ahead of end-of-day liquidation."
             elif not universe_ok and symbol not in held:
                 status, details = "Blocked", "Most Actives list did not refresh; automatic entries disabled."

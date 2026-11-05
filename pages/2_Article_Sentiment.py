@@ -44,7 +44,7 @@ with st.sidebar:
         "Stocks to analyze", available_symbols, default=available_symbols,
         help="Defaults to the same Most Actives and held-stock universe used by the main dashboard.",
     )
-    article_count = st.slider("Recent articles per stock", min_value=1, max_value=8, value=3)
+    article_count = st.slider("Recent articles per stock", min_value=1, max_value=8, value=7)
     lookback_days = st.slider("Lookback window (days)", min_value=1, max_value=30, value=1)
     run_analysis = st.button(
         "Fetch articles and measure sentiment", type="primary", disabled=not selected_symbols,
