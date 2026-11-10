@@ -1,65 +1,1167 @@
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>StockTrader</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StockTrader</title>
+<script defer src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
 <style>
-:root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#e7edf5;background:#0a1020}*{box-sizing:border-box}body{margin:0}.top{height:60px;background:#111a2d;border-bottom:1px solid #293750;display:flex;align-items:center;padding:0 20px;gap:22px;position:sticky;top:0;z-index:3}.brand{font-size:20px;font-weight:700}.tabs{display:flex;gap:6px}.tabs button,.secondary{border:0;background:#24334b;color:#dce6f4;padding:10px 13px;border-radius:7px;cursor:pointer}.tabs button.on,.primary{background:#2863db;color:white}.status{margin-left:auto;font-size:12px;color:#a3b1c7}.layout{display:grid;grid-template-columns:290px minmax(0,1fr);min-height:calc(100vh - 60px)}aside{padding:17px;background:#0e1728;border-right:1px solid #293750;position:sticky;top:60px;align-self:start;height:calc(100vh - 60px);overflow:auto}.content{padding:20px;max-width:1550px;width:100%;margin:auto;min-width:0}.field{margin:0 0 12px}.field label{display:block;font-size:12px;color:#aab8cc;margin-bottom:5px}.field input,.field select{width:100%;background:#17233a;color:#edf3fb;border:1px solid #374663;border-radius:6px;padding:8px}.field input[type=checkbox]{width:auto}.field button,.primary{width:100%;border:0;border-radius:7px;padding:10px;cursor:pointer;font-weight:600}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}.metric,.panel{background:#111b2e;border:1px solid #293750;border-radius:9px;padding:13px}.metric label{display:block;color:#9daec5;font-size:12px;margin-bottom:7px}.metric strong{font-size:21px}.metric em{display:block;color:#7bd5a8;font-style:normal;font-size:12px;margin-top:4px}.notice{padding:10px 12px;background:#173154;border:1px solid #2c5484;border-radius:7px;margin:8px 0}.notice.warning{background:#3a2d17;border-color:#765820}.notice.error{background:#3a2025;border-color:#7c3941}.table-wrap{overflow:auto;border:1px solid #293750;border-radius:8px;margin:10px 0 18px}table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #293750}th{background:#1a2942;color:#bdcbe0}tr:last-child td{border:0}.chart{height:370px;background:#111b2e;border-radius:9px;margin:10px 0 20px}.section{font-size:17px;margin:23px 0 9px}.caption{font-size:12px;color:#96a6bd;line-height:1.5}.hidden{display:none}@media(max-width:850px){.layout{grid-template-columns:1fr}aside{position:relative;top:0;height:auto;border-right:0;border-bottom:1px solid #293750}.content{padding:13px}.status{display:none}}
-:root{color-scheme:light;color:#172033;background:#fff}body{background:#fff;color:#172033}.top{background:#fff;border-color:#e2e8f0;box-shadow:0 2px 8px #1720330a}.brand{color:#111827}.tabs button{background:#eef2f7;color:#334155}.tabs button.on{background:#2563eb;color:#fff}.secondary{background:#e8edf4;color:#273449}.status,.caption{color:#64748b}aside{background:#f8fafc;border-color:#e2e8f0}.field label{color:#475569}.field input,.field select{background:#fff;color:#172033;border-color:#cbd5e1}.field input:focus,.field select:focus{outline:2px solid #93c5fd;border-color:#3b82f6}.metric,.panel{background:#fff;border-color:#e2e8f0;box-shadow:0 2px 6px #0f172a08}.metric label{color:#64748b}.metric strong{color:#0f172a}.metric em{color:#15803d}.notice{background:#eff6ff;border-color:#bfdbfe;color:#1e3a5f}.notice.warning{background:#fffbeb;border-color:#fde68a;color:#713f12}.notice.error{background:#fef2f2;border-color:#fecaca;color:#7f1d1d}.table-wrap{border-color:#e2e8f0;background:#fff}th,td{border-color:#e2e8f0;color:#1f2937}th{background:#f1f5f9;color:#334155}.chart{background:#fff}.section{color:#172033}a{color:#1d4ed8}.read-only .layout{grid-template-columns:minmax(0,1fr)}.read-only aside,.read-only #nav-news{display:none}
-</style></head><body>
-<header class="top"><strong class="brand">StockTrader</strong><nav class="tabs"><button id="nav-dash" class="on" onclick="showTab('dash')">Trading dashboard</button><button id="nav-news" onclick="showTab('news')">Article sentiment</button></nav><span id="status" class="status">Loading…</span></header>
-<section id="dash" class="layout"><aside><h3>Settings</h3><div id="controls"></div><div class="field"><label for="manual-symbols">Fallback symbols, comma separated</label><input id="manual-symbols" placeholder="NVDA, AAPL, MSFT"></div><div class="field"><label><input id="arm" type="checkbox"> Allow automatic orders after Start</label></div><div class="field"><label><input id="ack" type="checkbox"> I understand this sends real Production orders</label></div><div class="field"><label for="phrase">Type ENABLE LIVE TRADING</label><input id="phrase" type="password" autocomplete="off"></div><div class="field"><button class="primary" onclick="action('connect')">Connect / refresh account</button></div><div class="field"><button class="primary" onclick="action('start')">Start automation</button></div><div class="field"><button class="secondary" onclick="action('stop')">Stop automation</button></div><div class="field"><button class="secondary" onclick="action('refresh')">Refresh now</button></div><p class="caption">Production automation starts only after explicit authorization and the live-trading confirmation.</p></aside><main id="dashboard" class="content"></main></section>
-<section id="news" class="content hidden"><h1>Article sentiment</h1><p class="caption">Yahoo Finance headlines and snippets scored locally with FinBERT. Recent, confident sentiment prioritizes aligned HalfTrend signals.</p><div class="panel" style="display:flex;flex-wrap:wrap;gap:12px;align-items:end"><div class="field" style="flex:2;min-width:230px"><label>Stocks to analyze</label><select id="news-symbols" multiple size="8" style="width:100%"></select></div><div class="field"><label>Articles per stock</label><input id="count" type="number" value="7" min="1" max="8"></div><div class="field"><label>Lookback days</label><input id="days" type="number" value="7" min="1" max="30"></div><div class="field"><button class="primary" onclick="runSentiment()">Measure sentiment</button></div></div><div id="news-result"></div></section>
+:root {
+    font-family: Inter, "Segoe UI", Arial, sans-serif;
+    color: #172033;
+    background: #f5f7fb;
+    --blue: #2563eb;
+    --border: #e2e8f0;
+    --muted: #64748b;
+    --surface: #fff;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+
+.topbar {
+    height: 62px;
+    display: flex;
+    align-items: center;
+    padding: 0 22px;
+    gap: 22px;
+    background: white;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.brand {
+    font-size: 21px;
+    font-weight: 800;
+    letter-spacing: -.7px;
+}
+
+.brand span { color: var(--blue); }
+
+.nav {
+    display: flex;
+    gap: 5px;
+}
+
+.nav button {
+    border: 0;
+    background: transparent;
+    padding: 10px 15px;
+    border-radius: 7px;
+    cursor: pointer;
+    color: #475569;
+}
+
+.nav button.active {
+    color: var(--blue);
+    background: #eff6ff;
+    font-weight: 700;
+}
+
+.status {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.app {
+    display: grid;
+    grid-template-columns: 275px minmax(0,1fr);
+    min-height: calc(100vh - 62px);
+}
+
+.sidebar {
+    padding: 19px;
+    background: white;
+    border-right: 1px solid var(--border);
+    height: calc(100vh - 62px);
+    position: sticky;
+    top: 62px;
+    overflow-y: auto;
+}
+
+.sidebar h3 {
+    font-size: 15px;
+    margin: 0 0 18px;
+}
+
+.content {
+    min-width: 0;
+    padding: 25px;
+    max-width: 1700px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+.field { margin-bottom: 13px; }
+
+.field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #64748b;
+    margin-bottom: 6px;
+}
+
+.field input:not([type=checkbox]),
+.field select {
+    width: 100%;
+    padding: 9px 10px;
+    border: 1px solid #cbd5e1;
+    background: white;
+    color: #172033;
+    border-radius: 7px;
+}
+
+.field input:focus,
+.field select:focus {
+    outline: 2px solid #bfdbfe;
+    border-color: var(--blue);
+}
+
+.field input[type=checkbox] { margin-right: 6px; }
+
+.btn {
+    border: 0;
+    border-radius: 7px;
+    padding: 10px 13px;
+    cursor: pointer;
+    font-weight: 650;
+    font-size: 13px;
+}
+
+.btn-primary {
+    background: var(--blue);
+    color: white;
+}
+
+.btn-secondary {
+    background: #eef2f7;
+    color: #334155;
+}
+
+.btn-danger {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.btn:hover { filter: brightness(.96); }
+.btn-full { width: 100%; }
+
+.actions {
+    display: grid;
+    gap: 9px;
+    margin-top: 17px;
+}
+
+.heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.heading h1 {
+    font-size: 23px;
+    margin: 0;
+    letter-spacing: -.5px;
+}
+
+.subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 6px;
+}
+
+.metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit,minmax(175px,1fr));
+    gap: 13px;
+    margin-bottom: 20px;
+}
+
+.metric, .panel {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 17px;
+    box-shadow: 0 2px 5px #0f172a05;
+}
+
+.metric label {
+    color: var(--muted);
+    font-size: 12px;
+    display: block;
+    margin-bottom: 10px;
+}
+
+.metric strong {
+    display: block;
+    font-size: 24px;
+    font-weight: 750;
+    letter-spacing: -.6px;
+}
+
+.metric em {
+    display: block;
+    font-style: normal;
+    font-size: 11px;
+    margin-top: 7px;
+    color: #15803d;
+}
+
+.section {
+    font-size: 16px;
+    font-weight: 700;
+    margin: 25px 0 12px;
+}
+
+.table-wrap {
+    overflow-x: auto;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    margin-bottom: 20px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+th, td {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+}
+
+th {
+    background: #f8fafc;
+    color: #475569;
+    font-weight: 700;
+    text-transform: capitalize;
+}
+
+tr:last-child td { border-bottom: 0; }
+
+.chart {
+    height: 350px;
+    width: 100%;
+    margin-bottom: 20px;
+}
+
+.notice {
+    padding: 12px 14px;
+    background: #eff6ff;
+    color: #1e40af;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    margin-bottom: 12px;
+    font-size: 13px;
+}
+
+.warning {
+    background: #fffbeb;
+    color: #92400e;
+    border-color: #fde68a;
+}
+
+.error {
+    background: #fef2f2;
+    color: #991b1b;
+    border-color: #fecaca;
+}
+
+.caption {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.hidden { display: none !important; }
+
+.toolbar {
+    display: flex;
+    gap: 9px;
+    flex-wrap: wrap;
+}
+
+.toolbar button { width: auto; }
+
+#news-symbols {
+    min-width: 220px;
+    height: 160px;
+}
+
+.read-only .app { grid-template-columns: 1fr; }
+.read-only .sidebar,
+.read-only #nav-news { display: none; }
+
+@media(max-width:850px) {
+    .app { grid-template-columns: 1fr; }
+    .sidebar {
+        position: relative;
+        height: auto;
+        top: 0;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+    }
+    .content { padding: 15px; }
+    .topbar { padding: 0 12px; gap: 10px; }
+    .status { display: none; }
+    .heading h1 { font-size: 20px; }
+}
+
+@media(max-width:480px) {
+    .metrics { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .metric strong { font-size: 19px; }
+    .brand { font-size: 17px; }
+    .nav button { padding: 9px 8px; font-size: 12px; }
+}
+</style>
+</head>
+
+<body>
+
+<header class="topbar">
+    <div class="brand">Stock<span>Trader</span></div>
+
+    <nav class="nav">
+        <button id="nav-dash" class="active" onclick="showTab('dash')">
+            Dashboard
+        </button>
+        <button id="nav-news" onclick="showTab('news')">
+            Sentiment
+        </button>
+    </nav>
+
+    <span id="status" class="status">Initializing...</span>
+</header>
+
+<section id="dash" class="app">
+
+<aside class="sidebar">
+
+    <h3>Trading configuration</h3>
+
+    <div id="controls"></div>
+
+    <div class="field">
+        <label>Fallback symbols</label>
+        <input id="manual-symbols" placeholder="NVDA, AAPL, MSFT">
+    </div>
+
+    <div class="field">
+        <label>
+            <input id="arm" type="checkbox">
+            Enable automatic orders
+        </label>
+    </div>
+
+    <div class="field">
+        <label>
+            <input id="ack" type="checkbox">
+            Authorize Production orders
+        </label>
+    </div>
+
+    <div class="field">
+        <label>Type ENABLE LIVE TRADING</label>
+        <input id="phrase" type="password" autocomplete="off">
+    </div>
+
+    <div class="actions">
+        <button class="btn btn-primary btn-full"
+                onclick="action('connect')">
+            Connect account
+        </button>
+
+        <button class="btn btn-primary btn-full"
+                onclick="action('start')">
+            Start automation
+        </button>
+
+        <button class="btn btn-secondary btn-full"
+                onclick="action('stop')">
+            Stop automation
+        </button>
+
+        <button class="btn btn-secondary btn-full"
+                onclick="refresh()">
+            Refresh dashboard
+        </button>
+    </div>
+
+    <p class="caption">
+        Production orders require explicit authorization and confirmation.
+    </p>
+
+</aside>
+
+<main id="dashboard" class="content">
+
+    <div class="heading">
+        <div>
+            <h1>Trading dashboard</h1>
+            <div class="subtitle">Portfolio overview and trading activity</div>
+        </div>
+    </div>
+
+    <div class="notice">Loading portfolio data...</div>
+
+</main>
+</section>
+
+<section id="news" class="content hidden">
+
+    <div class="heading">
+        <div>
+            <h1>Article sentiment</h1>
+            <div class="subtitle">
+                Yahoo Finance headlines analyzed using FinBERT.
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="toolbar">
+
+            <div class="field">
+                <label>Stocks to analyze</label>
+                <select id="news-symbols" multiple size="7"></select>
+            </div>
+
+            <div class="field">
+                <label>Articles per stock</label>
+                <input id="count" type="number" value="7" min="1" max="8">
+            </div>
+
+            <div class="field">
+                <label>Lookback days</label>
+                <input id="days" type="number" value="7" min="1" max="30">
+            </div>
+
+            <div class="field">
+                <label>&nbsp;</label>
+                <button class="btn btn-primary" onclick="runSentiment()">
+                    Measure sentiment
+                </button>
+            </div>
+
+        </div>
+    </div>
+
+    <div id="news-result"></div>
+
+</section>
+
 <script>
-let state=null,activeTab='dash';const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function showTab(n){activeTab=n;document.getElementById('dash').classList.toggle('hidden',n!=='dash');document.getElementById('news').classList.toggle('hidden',n!=='news');document.getElementById('nav-dash').classList.toggle('on',n==='dash');document.getElementById('nav-news').classList.toggle('on',n==='news');if(n==='news')loadSymbols()}
-function buildControls(){
-    let defs=[['environment','Environment','select',['Sandbox','Production'],'Sandbox'],['interval','Candlestick interval','select',['1m','5m','15m','30m','60m'],'1m'],['period','Yahoo history','select',['7d','5d','30d','60d'],'7d'],['amplitude','HalfTrend amplitude','number',1,10,2],['channel_deviation','ATR channel deviation','number',0,10,2],['initial_capital','Simulator starting capital ($)','number',1,100000,500],['sim_allocation_pct','Simulator allocation (%)','number',1,100,20],['allocation_pct','Max account equity per position (%)','number',1,25,5],['max_portfolio_pct','Max total exposure (%)','number',10,100,50],['max_order_notional','Maximum notional per order ($)','number',25,10000,100],['max_gap_pct','Max quote / signal gap (%)','number',.1,5,.5],['daily_loss_pct','Pause new entries after daily loss (%)','number',.5,10,2]];let root=document.getElementById('controls');defs.forEach(d=>{let w=document.createElement('div');w.className='field';let l=document.createElement('label');l.textContent=d[1];w.appendChild(l);let e=document.createElement(d[2]==='select'?'select':'input');e.id='cfg-'+d[0];if(d[2]==='select')d[3].forEach(v=>{let o=document.createElement('option');o.value=v;o.textContent=v;e.appendChild(o)});else{e.type='number';e.min=d[3];e.max=d[4];e.step=(d[0].includes('pct')||d[0]==='channel_deviation')?'.1':'1';e.value=d[5]}w.appendChild(e);root.appendChild(w)});
+"use strict";
+
+let state = null;
+let activeTab = "dash";
+let refreshing = false;
+let saving = false;
+let sentimentRunning = false;
+let settingsTimer = null;
+let lastChartSymbol = null;
+
+const $ = id => document.getElementById(id);
+
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+}[c]));
+
+const money = v => "$" + Number(v || 0).toLocaleString(
+    undefined, {minimumFractionDigits:2, maximumFractionDigits:2}
+);
+
+const pct = v => Number(v || 0).toFixed(2) + "%";
+
+const metric = (name, value, sub="") =>
+    `<div class="metric">
+        <label>${esc(name)}</label>
+        <strong>${esc(value)}</strong>
+        ${sub ? `<em>${esc(sub)}</em>` : ""}
+    </div>`;
+
+const definitions = [
+    ["environment","Environment","select",["Sandbox","Production"],"Sandbox"],
+    ["interval","Candlestick interval","select",["1m","5m","15m","30m","60m"],"1m"],
+    ["period","Yahoo history","select",["7d","5d","30d","60d"],"7d"],
+    ["amplitude","HalfTrend amplitude","number",1,10,2],
+    ["channel_deviation","ATR channel deviation","number",0,10,2],
+    ["initial_capital","Simulator starting capital ($)","number",1,100000,500],
+    ["sim_allocation_pct","Simulator allocation (%)","number",1,100,20],
+    ["allocation_pct","Max equity per position (%)","number",1,25,5],
+    ["max_portfolio_pct","Maximum exposure (%)","number",10,100,50],
+    ["max_order_notional","Maximum order ($)","number",25,10000,100],
+    ["max_gap_pct","Maximum quote gap (%)","number",.1,5,.5],
+    ["daily_loss_pct","Daily loss limit (%)","number",.5,10,2]
+];
+
+function buildControls() {
+    const root = $("controls");
+    const fragment = document.createDocumentFragment();
+
+    definitions.forEach(d => {
+        const wrap = document.createElement("div");
+        wrap.className = "field";
+
+        const label = document.createElement("label");
+        label.textContent = d[1];
+
+        const input = document.createElement(
+            d[2] === "select" ? "select" : "input"
+        );
+
+        input.id = "cfg-" + d[0];
+
+        if (d[2] === "select") {
+            d[3].forEach(v => {
+                const option = document.createElement("option");
+                option.value = v;
+                option.textContent = v;
+                input.appendChild(option);
+            });
+        } else {
+            input.type = "number";
+            input.min = d[3];
+            input.max = d[4];
+            input.step = (d[0].includes("pct") ||
+                          d[0] === "channel_deviation") ? ".1" : "1";
+            input.value = d[5];
+        }
+
+        wrap.append(label, input);
+        fragment.appendChild(wrap);
+    });
+
+    root.appendChild(fragment);
 }
-function settings(){let s={};document.querySelectorAll('#controls input,#controls select').forEach(e=>{s[e.id.slice(4)]=e.type==='number'?Number(e.value):e.value});s.symbols=document.getElementById('manual-symbols').value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean);try{localStorage.setItem('stocktrader-settings',JSON.stringify(s))}catch(e){}return s}
-async function call(url,body){let r=await fetch(url,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});let d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}
-async function action(name){try{let r=await call('/api/controls',{settings:settings(),action:name,arm:document.getElementById('arm').checked,production_ack:document.getElementById('ack').checked,live_phrase:document.getElementById('phrase').value});document.getElementById('phrase').value='';render(r.snapshot)}catch(e){alert(e.message)}}
-async function setVirtualEquity(){let entered=prompt('Set Sandbox virtual equity ($)',String(state?.simulator?.equity_value??500));if(entered===null)return;let amount=Number(entered);if(!Number.isFinite(amount)||amount<=0){alert('Enter an amount greater than $0.');return}try{let r=await call('/api/controls',{settings:settings(),action:'set_virtual_equity',virtual_equity:amount});render(r.snapshot)}catch(e){alert(e.message)}}function money(v){return '$'+Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}function pct(v){return Number(v||0).toFixed(2)+'%'}function metric(n,v,sub=''){return '<div class="metric"><label>'+esc(n)+'</label><strong>'+esc(v)+'</strong>'+(sub?'<em>'+esc(sub)+'</em>':'')+'</div>'}
-function table(title,rows){let h='<h3 class="section">'+esc(title)+'</h3>';if(!rows||!rows.length)return h+'<p class="caption">No data available.</p>';let keys=Object.keys(rows[0]);return h+'<div class="table-wrap"><table><thead><tr>'+keys.map(k=>'<th>'+esc(k.replaceAll('_',' '))+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+keys.map(k=>'<td>'+esc(typeof r[k]==='object'&&r[k]!==null?JSON.stringify(r[k]):r[k])+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>'}
-function lineChart(id,title,rows){if(!rows||!rows.length)return '<h3 class="section">'+esc(title)+'</h3><p class="caption">No history recorded yet.</p>';let min=(document.getElementById('equity-start')?.value||'');if(min)rows=rows.filter(x=>String(x.time).slice(0,10)>=min);setTimeout(()=>Plotly.newPlot(id,[{x:rows.map(x=>x.time),y:rows.map(x=>x.value),type:'scatter',mode:'lines',line:{color:'#2563eb'}}],{title,paper_bgcolor:'#fff',plot_bgcolor:'#fff',font:{color:'#172033'},margin:{t:45,l:55,r:20,b:40},xaxis:{gridcolor:'#e2e8f0'},yaxis:{gridcolor:'#e2e8f0',tickprefix:'$'}},{responsive:true,displaylogo:false}),0);return '<h3 class="section">'+esc(title)+'</h3><div id="'+id+'" class="chart"></div>'}
-function render(d){state=d;let status=(d.environment||'')+' · '+(d.automation?'AUTOMATION ON':'Automation off')+' · '+(d.refreshed_at||'');document.getElementById('status').textContent=status;let html=(d.warnings||[]).map(x=>'<div class="notice warning">'+esc(x)+'</div>').join('');if(d.last_error)html+='<div class="notice error">'+esc(d.last_error)+'</div>';if(d.environment==='Sandbox'){let s=d.simulator||{};html+='<h2>Sandbox simulator</h2><button class="secondary" onclick="setVirtualEquity()">Change virtual equity</button><div class="metrics">'+metric('Daily profit',money(s.daily_profit),pct(s.daily_profit_pct))+metric('Total profit',money(s.total_profit),pct(s.total_profit_pct))+metric('Virtual equity',money(s.equity_value))+metric('Open positions',(d.positions||[]).length)+'</div>'+table('Simulator positions',d.positions||[])+lineChart('equity-chart','Sandbox equity over time',s.equity||[])}else{if(!d.connected)html+='<div class=notice>Production mode selected; connect the account to load holdings and balances.</div>';html+='<h2>Production account</h2><div class="metrics">'+metric('Net liquidation value',money(d.net_liquidation_value))+metric('Cash',money(d.cash))+metric('Open positions',(d.positions||[]).length)+metric('Automation',d.automation?'RUNNING':'OFF')+'</div>'+table('Current holdings',d.positions||[])+lineChart('equity-chart','Production equity over time',d.equity||[])+table('Signal and order activity',d.events||[])}html+=table('Latest HalfTrend signals',d.signals||[]);let syms=(d.signals||[]).map(x=>x.symbol);if(syms.length)html+='<div class="field"><label for="chart-symbol">Chart symbol</label><select id="chart-symbol">'+syms.map(s=>'<option>'+esc(s)+'</option>').join('')+'</select></div><div id="stock-chart" class="chart"></div>';document.getElementById('dashboard').innerHTML=html;if(syms.length){let el=document.getElementById('chart-symbol');el.onchange=()=>drawStock(el.value);drawStock(el.value)}}
-function drawStock(sym){let b=state?.bars?.[sym];if(!b)return;Plotly.newPlot('stock-chart',[{x:b.time,open:b.open,high:b.high,low:b.low,close:b.close,type:'candlestick',name:sym},{x:b.time,y:b.halftrend,type:'scatter',mode:'lines',name:'HalfTrend',line:{color:'#d97706',width:2}},{x:b.time,y:b.buy,type:'scatter',mode:'markers',name:'BUY',marker:{color:'#16a34a',symbol:'triangle-up',size:10}},{x:b.time,y:b.sell,type:'scatter',mode:'markers',name:'SELL',marker:{color:'#dc2626',symbol:'triangle-down',size:10}}],{title:sym+' · HalfTrend',paper_bgcolor:'#fff',plot_bgcolor:'#fff',font:{color:'#172033'},margin:{t:45,l:50,r:15,b:35},xaxis:{rangeslider:{visible:false},gridcolor:'#e2e8f0'},yaxis:{gridcolor:'#e2e8f0'}},{responsive:true,displaylogo:false})}
-const renderAccess=render;render=function(d){document.body.classList.toggle('read-only',d.access_mode==='view-only');renderAccess(d);if(d.access_mode==='view-only')document.getElementById('dashboard').insertAdjacentHTML('afterbegin','<div class="notice">Network view-only access. Trading settings and sentiment runs are available on the StockTrader host.</div>')};
-const renderCore=render;render=function(d){renderCore(d);let root=document.getElementById('dashboard');if(d.environment==='Sandbox'){root.insertAdjacentHTML('beforeend',table('Daily simulated realized profit',d.simulator?.daily||[])+table('Recent simulator trade log',d.simulator?.trades||[]))}else{let area=root.querySelector('.metrics');if(area)area.insertAdjacentHTML('beforeend',metric('Profit since app start',money(d.profit_since_start),d.account_number||''))}};
-async function refresh(){try{render(await call('/api/state'))}catch(e){document.getElementById('status').textContent=e.message}}
-async function loadSymbols(){let el=document.getElementById('news-symbols');if(el.options.length)return;try{let d=await call('/api/sentiment/universe');d.symbols.forEach(s=>{let o=document.createElement('option');o.value=s;o.textContent=s;o.selected=true;el.appendChild(o)})}catch(e){document.getElementById('news-result').textContent=e.message}}
-async function loadSelectedEnvironment(){
-    const cfg=settings();
-    const selected=cfg.environment;
-    document.getElementById('status').textContent='Loading '+selected+' environment after sentiment measurement…';
-    try{
-        const r=await call('/api/controls',{settings:cfg,action:'refresh'});
-        if(!r.snapshot)throw Error('The server did not return an environment snapshot.');
-        render(r.snapshot);
-        const control=document.getElementById('cfg-environment');
-        if(control)control.value=selected;
-        document.getElementById('status').textContent=selected+' environment loaded · '+(r.snapshot.refreshed_at||'');
-    }catch(e){
-        document.getElementById('status').textContent='Sentiment measured; '+selected+' environment could not be loaded · '+e.message;
-        document.getElementById('news-result').insertAdjacentHTML('beforeend','<div class="notice warning">Sentiment was measured, but the selected '+esc(selected)+' environment could not be loaded: '+esc(e.message)+'</div>');
-    }
-}
-async function runSentiment(){
-    const root=document.getElementById('news-result');
-    root.textContent='Fetching articles and scoring with FinBERT…';
-    try{
-        const d=await call('/api/sentiment',{
-            symbols:[...document.getElementById('news-symbols').selectedOptions].map(x=>x.value),
-            per_symbol:+document.getElementById('count').value,
-            lookback_days:+document.getElementById('days').value
+
+function settings() {
+    const result = {};
+
+    document.querySelectorAll("#controls input,#controls select")
+        .forEach(e => {
+            result[e.id.slice(4)] =
+                e.type === "number" ? Number(e.value) : e.value;
         });
-        const rows=d.articles||[];
-        const summary=table('Average sentiment by stock',d.summary||[]);
-        const err=d.scoring_error?'<div class="notice warning">Articles were fetched, but FinBERT scoring failed: '+esc(d.scoring_error)+'</div>':'';
-        root.innerHTML='<div class="metrics">'+metric('Articles fetched',rows.length)+metric('Stocks saved for strategy ranking',d.saved_symbols)+'</div>'+err+summary+table('Article measurements',rows)+(d.fetch_errors||[]).map(x=>'<div class="notice warning">'+esc(x)+'</div>').join('');
-        await loadSelectedEnvironment();
-    }catch(e){
-        root.innerHTML='<div class="notice error">'+esc(e.message)+'</div>';
+
+    result.symbols = $("manual-symbols").value
+        .split(",")
+        .map(x => x.trim().toUpperCase())
+        .filter(Boolean);
+
+    return result;
+}
+
+function persistSettings() {
+    try {
+        localStorage.setItem("stocktrader-settings",
+                             JSON.stringify(settings()));
+    } catch(e) {}
+}
+
+async function call(url, body) {
+    const response = await fetch(url, {
+        method: body ? "POST" : "GET",
+        headers: body ? {"Content-Type":"application/json"} : {},
+        body: body ? JSON.stringify(body) : undefined
+    });
+
+    const data = await response.json();
+
+    if (!response.ok)
+        throw Error(data.detail || "Request failed");
+
+    return data;
+}
+
+function showTab(name) {
+    activeTab = name;
+
+    $("dash").classList.toggle("hidden", name !== "dash");
+    $("news").classList.toggle("hidden", name !== "news");
+
+    $("nav-dash").classList.toggle("active", name === "dash");
+    $("nav-news").classList.toggle("active", name === "news");
+
+    if (name === "news") loadSymbols();
+}
+
+async function action(name) {
+    try {
+        const result = await call("/api/controls", {
+            settings: settings(),
+            action: name,
+            arm: $("arm").checked,
+            production_ack: $("ack").checked,
+            live_phrase: $("phrase").value
+        });
+
+        $("phrase").value = "";
+
+        if (result.snapshot) render(result.snapshot);
+
+    } catch(e) {
+        alert(e.message);
     }
 }
-let settingsTimer;async function saveSettings(){try{let cfg=settings();if(state&&cfg.environment!==state.environment){document.getElementById('status').textContent='Refreshing '+cfg.environment+' dashboard…';let d=await call('/api/controls',{settings:cfg,action:'refresh'});render(d.snapshot);return}let d=await call('/api/settings',{settings:cfg});if(d.snapshot)render(d.snapshot)}catch(e){document.getElementById('status').textContent='Settings not saved · '+e.message}}
-async function init(){buildControls();document.getElementById('controls').insertAdjacentHTML('beforeend','<div class="field"><label for="equity-start">Equity chart start date</label><input id="equity-start" type="date"></div>');try{let saved=JSON.parse(localStorage.getItem('stocktrader-settings')||'{}');Object.keys(saved).forEach(k=>{let e=document.getElementById('cfg-'+k);if(e)e.value=saved[k];else if(k==='symbols')document.getElementById('manual-symbols').value=saved[k].join(', ')});document.getElementById('equity-start').value=localStorage.getItem('stocktrader-equity-start')||''}catch(e){}document.getElementById('equity-start').onchange=e=>{localStorage.setItem('stocktrader-equity-start',e.target.value);state&&render(state)};document.querySelectorAll('#controls input,#controls select').forEach(e=>e.addEventListener('input',()=>{clearTimeout(settingsTimer);settingsTimer=setTimeout(saveSettings,500)}));document.querySelectorAll('#controls select,#manual-symbols').forEach(e=>e.addEventListener('change',()=>{clearTimeout(settingsTimer);settingsTimer=setTimeout(saveSettings,150)}));document.getElementById('manual-symbols').addEventListener('input',()=>{clearTimeout(settingsTimer);settingsTimer=setTimeout(saveSettings,500)});await refresh();await saveSettings();await loadSymbols();await runSentiment()}init();setInterval(()=>{if(activeTab==='dash')refresh()},60000);
-</script></body></html>
+
+async function setVirtualEquity() {
+    const entered = prompt(
+        "Set Sandbox virtual equity ($)",
+        String(state?.simulator?.equity_value ?? 500)
+    );
+
+    if (entered === null) return;
+
+    const amount = Number(entered);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        alert("Enter an amount greater than $0.");
+        return;
+    }
+
+    try {
+        const result = await call("/api/controls", {
+            settings: settings(),
+            action: "set_virtual_equity",
+            virtual_equity: amount
+        });
+
+        if (result.snapshot) render(result.snapshot);
+    } catch(e) {
+        alert(e.message);
+    }
+}
+
+function table(title, rows) {
+    let html = `<h3 class="section">${esc(title)}</h3>`;
+
+    if (!rows || !rows.length)
+        return html + `<p class="caption">No data available.</p>`;
+
+    const keys = Object.keys(rows[0]);
+
+    html += `<div class="table-wrap"><table><thead><tr>`;
+
+    html += keys.map(k =>
+        `<th>${esc(k.replaceAll("_"," "))}</th>`
+    ).join("");
+
+    html += `</tr></thead><tbody>`;
+
+    html += rows.map(row =>
+        `<tr>${keys.map(k =>
+            `<td>${esc(
+                typeof row[k] === "object" && row[k] !== null
+                    ? JSON.stringify(row[k]) : row[k]
+            )}</td>`
+        ).join("")}</tr>`
+    ).join("");
+
+    return html + `</tbody></table></div>`;
+}
+
+function lineChart(id, title, rows) {
+    if (!rows || !rows.length)
+        return `<h3 class="section">${esc(title)}</h3>
+                <p class="caption">No history recorded yet.</p>`;
+
+    const start = $("equity-start")?.value || "";
+
+    const filtered = start
+        ? rows.filter(x => String(x.time).slice(0,10) >= start)
+        : rows;
+
+    setTimeout(() => {
+        const el = $(id);
+        if (!el || !window.Plotly) return;
+
+        Plotly.react(el, [{
+            x: filtered.map(x => x.time),
+            y: filtered.map(x => x.value),
+            type: "scatter",
+            mode: "lines",
+            line: {color:"#2563eb",width:2}
+        }], {
+            title,
+            paper_bgcolor:"#fff",
+            plot_bgcolor:"#fff",
+            font:{color:"#172033"},
+            margin:{t:45,l:55,r:20,b:40},
+            xaxis:{gridcolor:"#e2e8f0"},
+            yaxis:{gridcolor:"#e2e8f0",tickprefix:"$"}
+        }, {
+            responsive:true,
+            displaylogo:false
+        });
+    }, 0);
+
+    return `<h3 class="section">${esc(title)}</h3>
+            <div id="${id}" class="chart"></div>`;
+}
+
+function drawStock(symbol) {
+    const bars = state?.bars?.[symbol];
+    const el = $("stock-chart");
+
+    if (!bars || !el || !window.Plotly) return;
+
+    lastChartSymbol = symbol;
+
+    Plotly.react(el, [
+        {
+            x:bars.time,
+            open:bars.open,
+            high:bars.high,
+            low:bars.low,
+            close:bars.close,
+            type:"candlestick",
+            name:symbol
+        },
+        {
+            x:bars.time,
+            y:bars.halftrend,
+            type:"scatter",
+            mode:"lines",
+            name:"HalfTrend",
+            line:{color:"#d97706",width:2}
+        },
+        {
+            x:bars.time,
+            y:bars.buy,
+            type:"scatter",
+            mode:"markers",
+            name:"BUY",
+            marker:{color:"#16a34a",symbol:"triangle-up",size:10}
+        },
+        {
+            x:bars.time,
+            y:bars.sell,
+            type:"scatter",
+            mode:"markers",
+            name:"SELL",
+            marker:{color:"#dc2626",symbol:"triangle-down",size:10}
+        }
+    ], {
+        title:symbol + " · HalfTrend",
+        paper_bgcolor:"#fff",
+        plot_bgcolor:"#fff",
+        font:{color:"#172033"},
+        margin:{t:45,l:50,r:15,b:35},
+        xaxis:{rangeslider:{visible:false},gridcolor:"#e2e8f0"},
+        yaxis:{gridcolor:"#e2e8f0"}
+    }, {
+        responsive:true,
+        displaylogo:false
+    });
+}
+
+function render(d) {
+    state = d;
+
+    document.body.classList.toggle(
+        "read-only", d.access_mode === "view-only"
+    );
+
+    $("status").textContent =
+        (d.environment || "") + " · " +
+        (d.automation ? "AUTOMATION ON" : "Automation off") +
+        " · " + (d.refreshed_at || "");
+
+    let html = "";
+
+    html += (d.warnings || []).map(x =>
+        `<div class="notice warning">${esc(x)}</div>`
+    ).join("");
+
+    if (d.last_error)
+        html += `<div class="notice error">${esc(d.last_error)}</div>`;
+
+    if (d.environment === "Sandbox") {
+        const s = d.simulator || {};
+
+        html += `
+            <div class="heading">
+                <div>
+                    <h1>Sandbox simulator</h1>
+                    <div class="subtitle">Virtual portfolio performance</div>
+                </div>
+                <button class="btn btn-secondary"
+                    onclick="setVirtualEquity()">Adjust capital</button>
+            </div>
+            <div class="metrics">
+                ${metric("Daily profit",money(s.daily_profit),
+                         pct(s.daily_profit_pct))}
+                ${metric("Total profit",money(s.total_profit),
+                         pct(s.total_profit_pct))}
+                ${metric("Virtual equity",money(s.equity_value))}
+                ${metric("Open positions",(d.positions || []).length)}
+            </div>
+        `;
+
+        html += table("Simulator positions",d.positions || []);
+        html += lineChart("equity-chart","Sandbox equity over time",
+                          s.equity || []);
+
+        html += table("Daily simulated realized profit",s.daily || []);
+        html += table("Recent simulator trade log",s.trades || []);
+
+    } else {
+        if (!d.connected)
+            html += `<div class="notice">
+                Production selected. Connect your account to load balances.
+            </div>`;
+
+        html += `
+            <div class="heading">
+                <div>
+                    <h1>Production account</h1>
+                    <div class="subtitle">Live portfolio monitoring</div>
+                </div>
+            </div>
+            <div class="metrics">
+                ${metric("Net liquidation value",
+                         money(d.net_liquidation_value))}
+                ${metric("Available cash",money(d.cash))}
+                ${metric("Open positions",(d.positions || []).length)}
+                ${metric("Automation",
+                         d.automation ? "RUNNING" : "OFF")}
+                ${metric("Profit since app start",
+                         money(d.profit_since_start),
+                         d.account_number || "")}
+            </div>
+        `;
+
+        html += table("Current holdings",d.positions || []);
+        html += lineChart("equity-chart","Production equity over time",
+                          d.equity || []);
+        html += table("Signal and order activity",d.events || []);
+    }
+
+    html += table("Latest HalfTrend signals",d.signals || []);
+
+    const symbols = [...new Set(
+        (d.signals || []).map(x => x.symbol).filter(Boolean)
+    )];
+
+    if (symbols.length) {
+        html += `
+            <h3 class="section">Technical analysis</h3>
+            <div class="field">
+                <label>Chart symbol</label>
+                <select id="chart-symbol">
+                    ${symbols.map(s =>
+                        `<option value="${esc(s)}">${esc(s)}</option>`
+                    ).join("")}
+                </select>
+            </div>
+            <div id="stock-chart" class="chart"></div>
+        `;
+    }
+
+    $("dashboard").innerHTML = html;
+
+    if (d.access_mode === "view-only") {
+        $("dashboard").insertAdjacentHTML("afterbegin",
+            `<div class="notice">
+                Network view-only access. Trading controls and sentiment
+                runs are available on the StockTrader host.
+            </div>`);
+    }
+
+    const selector = $("chart-symbol");
+
+    if (selector) {
+        if (lastChartSymbol && symbols.includes(lastChartSymbol))
+            selector.value = lastChartSymbol;
+
+        selector.onchange = () => drawStock(selector.value);
+        drawStock(selector.value);
+    }
+}
+
+async function refresh() {
+    if (refreshing || document.hidden || activeTab !== "dash") return;
+
+    refreshing = true;
+
+    try {
+        const data = await call("/api/state");
+        render(data);
+    } catch(e) {
+        $("status").textContent = "Refresh failed · " + e.message;
+    } finally {
+        refreshing = false;
+    }
+}
+
+async function loadSymbols() {
+    const el = $("news-symbols");
+
+    if (el.options.length) return;
+
+    try {
+        const data = await call("/api/sentiment/universe");
+        const fragment = document.createDocumentFragment();
+
+        (data.symbols || []).forEach(symbol => {
+            const option = document.createElement("option");
+            option.value = symbol;
+            option.textContent = symbol;
+            option.selected = true;
+            fragment.appendChild(option);
+        });
+
+        el.appendChild(fragment);
+    } catch(e) {
+        $("news-result").textContent = e.message;
+    }
+}
+
+async function loadSelectedEnvironment() {
+    const selected = $("cfg-environment").value;
+
+    $("status").textContent =
+        "Loading " + selected + " environment...";
+
+    try {
+        const result = await call("/api/controls", {
+            settings: settings(),
+            action:"refresh"
+        });
+        if (!result.snapshot)
+            throw Error("Environment snapshot missing.");
+        render(result.snapshot);
+        // Keep the selected environment displayed.
+        $("cfg-environment").value = selected;
+    } catch(e) {
+        $("status").textContent =
+            "Environment refresh failed · " + e.message;
+
+        $("news-result").insertAdjacentHTML("beforeend",
+            `<div class="notice warning">
+                Sentiment was measured, but environment refresh failed:
+                ${esc(e.message)}
+            </div>`);
+    }
+}
+
+async function runSentiment() {
+    if (sentimentRunning) return;
+
+    sentimentRunning = true;
+
+    const root = $("news-result");
+    root.textContent = "Scoring articles with FinBERT...";
+
+    try {
+        await loadSymbols();
+
+        const result = await call("/api/sentiment", {
+            symbols:[...$("news-symbols").selectedOptions]
+                .map(x => x.value),
+            per_symbol:+$("count").value,
+            lookback_days:+$("days").value
+        });
+
+        const rows = result.articles || [];
+
+        let html = `
+            <div class="metrics">
+                ${metric("Articles fetched",rows.length)}
+                ${metric("Stocks ranked",result.saved_symbols)}
+            </div>
+        `;
+
+        if (result.scoring_error) {
+            html += `<div class="notice warning">
+                FinBERT scoring failed: ${esc(result.scoring_error)}
+            </div>`;
+        }
+
+        html += table("Average sentiment by stock",
+                      result.summary || []);
+
+        html += table("Article measurements",rows);
+
+        html += (result.fetch_errors || []).map(x =>
+            `<div class="notice warning">${esc(x)}</div>`
+        ).join("");
+
+        root.innerHTML = html;
+
+        // Preserve the required sentiment-before-environment sequence.
+        await loadSelectedEnvironment();
+
+    } catch(e) {
+        root.innerHTML =
+            `<div class="notice error">${esc(e.message)}</div>`;
+    } finally {
+        sentimentRunning = false;
+    }
+}
+
+
+async function saveSettings() {
+    if (saving) return;
+
+    saving = true;
+
+    try {
+        const cfg = settings();
+        persistSettings();
+
+        const environmentChanged =
+            state && cfg.environment !== state.environment;
+
+        if (environmentChanged) {
+            $("status").textContent =
+                "Switching to " + cfg.environment + "...";
+
+            const result = await call("/api/controls", {
+                settings: cfg,
+                action: "refresh"
+            });
+
+            if (!result.snapshot) {
+                throw Error("Environment refresh returned no snapshot.");
+            }
+
+            // Rebuild dashboard using the new environment snapshot.
+            render(result.snapshot);
+
+            // Ensure selector matches the selected environment.
+            $("cfg-environment").value = cfg.environment;
+
+            $("status").textContent =
+                cfg.environment + " dashboard refreshed · " +
+                (result.snapshot.refreshed_at || "");
+
+            return;
+        }
+
+        // Normal settings update when environment hasn't changed.
+        const result = await call("/api/settings", {
+            settings: cfg
+        });
+
+        if (result.snapshot) {
+            render(result.snapshot);
+        }
+
+    } catch(e) {
+        $("status").textContent =
+            "Settings update failed · " + e.message;
+
+    } finally {
+        saving = false;
+    }
+}
+
+function scheduleSave(delay=600) {
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(saveSettings,delay);
+}
+
+function restoreSettings() {
+    try {
+        const saved = JSON.parse(
+            localStorage.getItem("stocktrader-settings") || "{}"
+        );
+
+        Object.keys(saved).forEach(k => {
+            const el = $("cfg-" + k);
+
+            if (el) el.value = saved[k];
+
+            if (k === "symbols")
+                $("manual-symbols").value =
+                    Array.isArray(saved[k]) ? saved[k].join(", ") : "";
+        });
+
+        $("equity-start").value =
+            localStorage.getItem("stocktrader-equity-start") || "";
+
+    } catch(e) {}
+}
+
+async function init() {
+    buildControls();
+
+    $("controls").insertAdjacentHTML("beforeend",`
+        <div class="field">
+            <label>Equity chart start date</label>
+            <input id="equity-start" type="date">
+        </div>
+    `);
+
+    restoreSettings();
+
+    $("controls").addEventListener("change", e => {
+    if (e.target.id === "cfg-environment") {
+        clearTimeout(settingsTimer);
+        saveSettings();
+    } else {
+        scheduleSave(200);
+    }
+    });
+
+    // Bind events once rather than rebuilding controls.
+    $("controls").addEventListener("input",e => {
+        if (e.target.id !== "equity-start")
+            scheduleSave();
+    });
+
+    $("controls").addEventListener("change",e => {
+        if (e.target.id === "equity-start") {
+            localStorage.setItem(
+                "stocktrader-equity-start",e.target.value
+            );
+            if (state) render(state);
+        } else {
+            scheduleSave(200);
+        }
+    });
+
+    $("manual-symbols").addEventListener("input",() => scheduleSave());
+    $("manual-symbols").addEventListener("change",() => scheduleSave(200));
+
+    // Load sentiment universe first, then score it.
+    // Avoid the old startup sequence of multiple redundant refreshes.
+    try {
+        await loadSymbols();
+        await runSentiment();
+    } catch(e) {
+        $("status").textContent = "Initialization error · " + e.message;
+    }
+}
+
+// Avoid polling when the browser tab is inactive.
+document.addEventListener("visibilitychange",() => {
+    if (!document.hidden && activeTab === "dash")
+        refresh();
+});
+
+// One dashboard refresh per minute, without overlapping requests.
+setInterval(() => {
+    if (!document.hidden && activeTab === "dash")
+        refresh();
+},60000);
+
+init();
+</script>
+</body>
+</html>

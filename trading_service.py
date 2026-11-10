@@ -15,9 +15,8 @@ import pandas as pd
 from market_data import fetch_most_active_symbols, fetch_yfinance_delayed_closes, fetch_yfinance_ohlc
 from observed_universe import save_observed_symbols
 from sentiment_store import load_sentiment_snapshot, sentiment_priority
-from strategy import crossover_signals
+from strategy import crossover_signals, get_last_signal
 from tastytrade_client_orders import PRODUCTION_URL, SANDBOX_URL, TastytradeAPIError, TastytradeClient
-
 
 PT, ET = ZoneInfo("America/Los_Angeles"), ZoneInfo("America/New_York")
 INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
@@ -63,6 +62,7 @@ class TradingService:
                          "simulator": {}, "equity": [], "events": [], "bars": {},
                          "updated_at": None, "warnings": [], "connected": False,
                          "automation": False}
+        self.FIRST_TRADE = True
         self.init_db()
 
     def init_db(self):
@@ -165,6 +165,30 @@ class TradingService:
                 raise RuntimeError("Connect to an account in the selected environment before starting automation.")
             self.auto_enabled = True
 
+    def in_beginning_window(self,now_pt=None):
+        """6:30 to 8:00 AM Pacific, Monday through Friday."""
+        if now_pt is None:
+            now_pt = datetime.now(PT)
+
+        local_time = now_pt.astimezone(PT).time().replace(tzinfo=None)
+
+        return (
+            now_pt.astimezone(PT).weekday() < 5
+            and wall_time(6, 30) <= local_time < wall_time(8, 0)
+        )
+
+    def in_preclose_window(self, now_pt=None):
+        """12:45 PM to 1:00 PM Pacific, Monday through Friday."""
+        if now_pt is None:
+            now_pt = datetime.now(PT)
+
+        local_time = now_pt.astimezone(PT).time().replace(tzinfo=None)
+
+        return (
+            now_pt.astimezone(PT).weekday() < 5
+            and wall_time(12, 45) <= local_time < wall_time(13, 0)
+        )
+
     def refresh(self):
         with self.lock:
             cfg = dict(self.settings)
@@ -205,12 +229,17 @@ class TradingService:
         sentiment = load_sentiment_snapshot(self.db_path, max_age_hours=24)
         now = pd.Timestamp.now(tz="UTC")
         mins = INTERVAL_MINUTES[cfg["interval"]]
+        count = 0
+        num_symbols = len(ohlc)
+        frames = {}
         for symbol, frame in ohlc.items():
+            count += 1
             if len(frame) < max(10, int(cfg["amplitude"]) + 1):
                 continue
             result = crossover_signals(frame, amplitude=int(cfg["amplitude"]),
                                        channel_deviation=float(cfg["channel_deviation"]))
             stamp = pd.Timestamp(frame.index[-1])
+            frames[symbol] = result
             if stamp.tzinfo is None:
                 stamp = stamp.tz_localize(ET)
             bar_end = stamp + pd.Timedelta(minutes=mins)
@@ -225,7 +254,12 @@ class TradingService:
             if frame.empty:
                 continue
             age = max(0.0, (now - bar_end.tz_convert("UTC")).total_seconds())
-            row = result.iloc[-1]
+            loc = -1
+            if self.in_beginning_window() and self.FIRST_TRADE:
+                signal, loc = get_last_signal(result)
+                if count == (num_symbols - 1):
+                    self.FIRST_TRADE = False
+            row = result.iloc[loc]
             side = "BUY" if bool(row.buy_signal) else ("SELL" if bool(row.sell_signal) else "HOLD")
             close = float(frame.iloc[-1].Close)
             signal_time = str(result.index[-1])
@@ -244,7 +278,6 @@ class TradingService:
                             "buy": frame.Close.tail(300).astype(object).where(result.buy_signal.tail(300), None).tolist(),
                             "sell": frame.Close.tail(300).astype(object).where(result.sell_signal.tail(300), None).tolist(),
                             "signal": result.signal.tail(300).fillna("").tolist()}
-
         quote_map = {}
         if production and client and account:
             try:
@@ -276,9 +309,34 @@ class TradingService:
             self._simulator(cfg, signals, yahoo_prices)
             positions_out = self._sim_positions(cfg)
 
-        if production and auto and client and account:
-            self._execute_orders(cfg, client, account, balance, positions, orders, signals, quote_map, yahoo_prices, warnings)
+        # Run normal production trading when automation is enabled.
+        # Always run the production closeout during the EOD window,
+        # even if automatic trading is disabled.
+        eod_closeout = (
+            production
+            and self.in_preclose_window()
+        )
 
+        if (
+            production
+            and client
+            and account
+            and env == cfg["environment"]
+            and (auto or eod_closeout)
+        ):
+            self._execute_orders(
+                cfg,
+                client,
+                account,
+                balance,
+                positions,
+                orders,
+                signals,
+                quote_map,
+                yahoo_prices,
+                warnings,
+                frames
+            )
         account_key = f"{cfg['environment']}:{account}"
         equity = []
         events = []
@@ -423,114 +481,861 @@ class TradingService:
                 "daily":[{"day":r[0],"realized_pnl":r[1]} for r in daily_history],
                 "trades":[{"day":r[0],"symbol":r[1],"signal":r[2],"action":r[3],"quantity":r[4],"price":r[5],"realized_pnl":r[6],"time":r[7]} for r in trades]}
 
-    def _execute_orders(self, cfg, client, account, balance, positions, orders, signals, quotes, yahoo_prices, warnings):
-        now=datetime.now(PT)
-        qty_by={}
-        portfolio=[]
+    def _execute_orders(
+        self,
+        cfg,
+        client,
+        account,
+        balance,
+        positions,
+        orders,
+        signals,
+        quotes,
+        yahoo_prices,
+        warnings,
+        frames
+    ):
+        now = datetime.now(PT)
+        account_key = f"Production:{account}"
+
+        # =========================================================
+        # 1. BUILD CURRENT POSITION QUANTITIES
+        # =========================================================
+
+        qty_by = {}
+
         for p in positions:
-            sym=str(p.get("underlying-symbol",p.get("symbol",""))).upper()
-            q=number(p,"quantity")*(-1 if str(p.get("quantity-direction","Long")).lower()=="short" else 1)
-            qty_by[sym]=q
-            mark=number(quotes.get(sym,{}),"mark","mid","last",default=yahoo_prices.get(sym,0))
-            portfolio.append((sym,q,mark))
-        nlv=number(balance,"net-liquidating-value","net_liquidating_value")
-        cash=number(balance,"cash-balance","cash_balance")
-        buying=number(balance,"equity-buying-power","equity_buying_power",default=cash)
-        active=set()
+            symbol = str(
+                p.get("underlying-symbol", p.get("symbol", ""))
+            ).upper()
+
+            if not symbol:
+                continue
+
+            quantity = number(p, "quantity")
+
+            direction = str(
+                p.get("quantity-direction", "Long")
+            ).lower()
+
+            if direction == "short":
+                quantity *= -1
+
+            qty_by[symbol] = qty_by.get(symbol, 0.0) + quantity
+
+        portfolio = []
+
+        for symbol, quantity in qty_by.items():
+            mark = number(
+                quotes.get(symbol, {}),
+                "mark",
+                "mid",
+                "last",
+                default=yahoo_prices.get(symbol, 0)
+            )
+
+            if quantity:
+                portfolio.append((symbol, quantity, mark))
+
+        # =========================================================
+        # 2. ACCOUNT BALANCES
+        # =========================================================
+
+        nlv = number(
+            balance,
+            "net-liquidating-value",
+            "net_liquidating_value"
+        )
+
+        cash = number(
+            balance,
+            "cash-balance",
+            "cash_balance"
+        )
+
+        buying = number(
+            balance,
+            "equity-buying-power",
+            "equity_buying_power",
+            default=cash
+        )
+
+        # =========================================================
+        # 3. IDENTIFY WORKING ORDERS
+        # =========================================================
+
+        active = set()
+        working_orders = []
+
         for item in orders:
-            o=item.get("order",item) if isinstance(item,dict) else {}
-            if str(o.get("status","")).lower() not in TERMINAL_ORDER_STATES:
-                active.update(str(l.get("symbol","")).upper() for l in o.get("legs",[]))
+            order = (
+                item.get("order", item)
+                if isinstance(item, dict)
+                else {}
+            )
+
+            if not isinstance(order, dict):
+                continue
+
+            status_value = str(
+                order.get("status", "")
+            ).lower()
+
+            if status_value in TERMINAL_ORDER_STATES:
+                continue
+
+            legs = order.get("legs", []) or []
+
+            symbols = [
+                str(leg.get("symbol", "")).upper()
+                for leg in legs
+                if leg.get("symbol")
+            ]
+
+            if not symbols:
+                continue
+
+            active.update(symbols)
+
+            source = str(
+                order.get("source", "")
+                or order.get("external-identifier", "")
+                or order.get("external_identifier", "")
+            )
+
+            working_orders.append({
+                "order": order,
+                "symbols": symbols,
+                "source": source
+            })
+
+        # =========================================================
+        # 4. DAILY LOSS RESTRICTION
+        # =========================================================
+
         with sqlite3.connect(self.db_path) as db:
-            dayrows=db.execute("SELECT net_liquidating_value FROM equity WHERE account_key=? AND timestamp LIKE ? ORDER BY timestamp",(f"Production:{account}",now.date().isoformat()+"%")).fetchall()
-        dayloss=bool(dayrows and nlv<=float(dayrows[0][0])*(1-float(cfg["daily_loss_pct"])/100))
-        if now.weekday()<5 and wall_time(12,45)<=now.time().replace(tzinfo=None)<wall_time(13,0):
-            working = []
-            for item in orders:
-                order=item.get("order",item) if isinstance(item,dict) else {}
-                if str(order.get("status","")).lower() in TERMINAL_ORDER_STATES: continue
-                for leg in order.get("legs",[]) or []:
-                    if str(leg.get("instrument-type","Equity")).lower() not in ("equity","stock"):
-                        continue
-                    symbol=str(leg.get("symbol","")).upper()
-                    working.append(symbol)
-                    try: client.cancel_order(account,str(order.get("id",order.get("order-id",""))))
-                    except Exception as exc: warnings.append(f"Cancel {symbol}: {exc}")
-            if working:
-                warnings.append("Production closeout is waiting for working-order cancellations: " + ", ".join(sorted(set(working))))
+            dayrows = db.execute(
+                """
+                SELECT net_liquidating_value
+                FROM equity
+                WHERE account_key=?
+                AND timestamp LIKE ?
+                ORDER BY timestamp
+                """,
+                (
+                    account_key,
+                    now.date().isoformat() + "%"
+                )
+            ).fetchall()
+
+        dayloss = bool(
+            dayrows
+            and float(dayrows[0][0]) > 0
+            and nlv <= float(dayrows[0][0]) * (
+                1 - float(cfg["daily_loss_pct"]) / 100
+            )
+        )
+
+        # =========================================================
+        # 5. PRODUCTION END-OF-DAY CLOSEOUT
+        #    12:45–1:00 PM PACIFIC
+        # =========================================================
+
+        if self.in_preclose_window(now):
+
+            warnings.append(
+                "Production EOD closeout active "
+                "(12:45–1:00 PM Pacific)."
+            )
+
+            working_symbols = set()
+            cancellation_failed = False
+
+            # -----------------------------------------------------
+            # Identify existing EOD close orders.
+            # Do not cancel them or submit duplicate closes.
+            # -----------------------------------------------------
+
+            for item in working_orders:
+
+                source = item["source"].lower()
+
+                is_eod_order = (
+                    "stocktrader/eod" in source
+                )
+
+                if is_eod_order:
+                    working_symbols.update(item["symbols"])
+
+            # -----------------------------------------------------
+            # Cancel other working equity orders.
+            # -----------------------------------------------------
+
+            for item in working_orders:
+
+                order = item["order"]
+                symbols = item["symbols"]
+                source = item["source"].lower()
+
+                if "stocktrader/eod" in source:
+                    continue
+
+                order_id = str(
+                    order.get(
+                        "id",
+                        order.get("order-id", "")
+                    )
+                )
+
+                if not order_id:
+                    warnings.append(
+                        f"Cannot cancel working order for {symbols}: "
+                        "broker order ID is missing."
+                    )
+
+                    cancellation_failed = True
+                    working_symbols.update(symbols)
+                    continue
+
+                try:
+                    client.cancel_order(account, order_id)
+
+                    working_symbols.update(symbols)
+
+                    warnings.append(
+                        f"Cancellation requested for working order "
+                        f"{order_id}."
+                    )
+
+                except Exception as exc:
+
+                    cancellation_failed = True
+                    working_symbols.update(symbols)
+
+                    warnings.append(
+                        f"Could not cancel working order "
+                        f"{order_id}: {exc}"
+                    )
+
+            # Do not submit close orders until previous working
+            # orders have been reconciled by a subsequent refresh.
+            if working_symbols or cancellation_failed:
+
+                warnings.append(
+                    "EOD closeout waiting for existing orders "
+                    "to clear: "
+                    + ", ".join(sorted(working_symbols))
+                )
+
                 return
-            for symbol,q,mark in portfolio:
-                if not q or mark<=0: continue
-                action="Sell to Close" if q>0 else "Buy to Close"
-                qty=abs(q)
+
+            # -----------------------------------------------------
+            # Close every remaining position.
+            # -----------------------------------------------------
+
+            for symbol, quantity, mark in portfolio:
+
+                if not quantity:
+                    continue
+
+                action = (
+                    "Sell to Close"
+                    if quantity > 0
+                    else "Buy to Close"
+                )
+
+                qty = abs(quantity)
+
+                fractional_qty = not float(qty).is_integer()
+
                 try:
-                    if not float(qty).is_integer():
-                        if q < 0:
-                            raise ValueError("Fractional short positions cannot be closed by this strategy.")
-                        definition=payload(client.get_equity(symbol))
-                        if not definition.get("is-fractional-quantity-eligible"):
-                            raise ValueError("The broker does not mark this stock eligible for fractional closing.")
-                        order=client.build_equity_order(symbol,action,round(qty,4),mark,
-                                                        source="StockTrader/EOD",allow_fractional=True)
+
+                    # ---------------------------------------------
+                    # Fractional position
+                    # ---------------------------------------------
+
+                    if fractional_qty:
+
+                        if mark <= 0:
+                            raise ValueError(
+                                "Fractional close requires a usable "
+                                "market price."
+                            )
+
+                        definition = payload(
+                            client.get_equity(symbol)
+                        )
+
+                        if not definition.get(
+                            "is-fractional-quantity-eligible"
+                        ):
+                            raise ValueError(
+                                f"Position quantity {qty:g} is fractional, "
+                                "but the instrument does not support "
+                                "fractional orders."
+                            )
+
+                        order = client.build_equity_order(
+                            symbol,
+                            action,
+                            round(qty, 4),
+                            mark,
+                            source="StockTrader/EOD",
+                            allow_fractional=True
+                        )
+
+                    # ---------------------------------------------
+                    # Whole-share position
+                    # ---------------------------------------------
+
                     else:
-                        order=client.build_equity_market_close(symbol,action,int(qty),source="StockTrader/EOD")
-                    dry=payload(client.dry_run_order(account,order)); errs=dry.get("errors",[]) if isinstance(dry,dict) else []
-                    warns=dry.get("warnings",[]) if isinstance(dry,dict) else []
-                    if errs or warns: raise TastytradeAPIError(f"EOD dry-run blocked: {errs} {warns}")
-                    client.submit_order(account,order,confirm_live=True,max_order_notional=qty*mark,risk_reference_price=mark)
-                except Exception as exc: warnings.append(f"EOD close {symbol} needs attention: {exc}")
+
+                        order = client.build_equity_market_close(
+                            symbol,
+                            action,
+                            int(qty),
+                            source="StockTrader/EOD"
+                        )
+
+                    # ---------------------------------------------
+                    # Broker dry run
+                    # ---------------------------------------------
+
+                    dry = payload(
+                        client.dry_run_order(account, order)
+                    )
+
+                    errors = (
+                        dry.get("errors", [])
+                        if isinstance(dry, dict)
+                        else []
+                    )
+
+                    broker_warnings = (
+                        dry.get("warnings", [])
+                        if isinstance(dry, dict)
+                        else []
+                    )
+
+                    if errors or broker_warnings:
+                        raise TastytradeAPIError(
+                            f"EOD dry-run blocked: "
+                            f"{errors} {broker_warnings}"
+                        )
+
+                    # ---------------------------------------------
+                    # Submit close order
+                    # ---------------------------------------------
+
+                    client.submit_order(
+                        account,
+                        order,
+                        confirm_live=True,
+                        max_order_notional=(
+                            qty * mark if mark > 0 else None
+                        ),
+                        risk_reference_price=(
+                            mark if mark > 0 else None
+                        )
+                    )
+
+                    warnings.append(
+                        f"EOD close submitted: {symbol}, "
+                        f"{action}, quantity={qty:g}."
+                    )
+
+                except Exception as exc:
+
+                    warnings.append(
+                        f"EOD close {symbol} needs attention: {exc}"
+                    )
+
+            # Never process normal signals during EOD closeout.
             return
-        if not (now.weekday()<5 and wall_time(9,30)<=now.astimezone(ET).time().replace(tzinfo=None)<wall_time(16,0)):
+
+        # =========================================================
+        # 6. REGULAR MARKET HOURS
+        # =========================================================
+
+        now_et = now.astimezone(ET)
+
+        if not (
+            now_et.weekday() < 5
+            and wall_time(9, 30)
+            <= now_et.time().replace(tzinfo=None)
+            < wall_time(16, 0)
+        ):
             return
-        ordered=sorted(signals.values(),key=lambda r:(r["priority"],r.get("sentiment",{}).get("confidence",0)),reverse=True)
+
+        # =========================================================
+        # 7. ORDER SIGNALS BY PRIORITY
+        # =========================================================
+
+        ordered = sorted(
+            signals.values(),
+            key=lambda row: (
+                row["priority"],
+                row.get("sentiment", {}).get("confidence", 0)
+            ),
+            reverse=True
+        )
+
         for row in ordered:
-            symbol,side,stamp=row["symbol"],row["signal"],row["signal_time"]
-            if side not in ("BUY","SELL"): continue
+
+            symbol = row["symbol"]
+            side = row["signal"]
+            stamp = row["signal_time"]
+
+            if side not in ("BUY", "SELL"):
+                continue
+
+            # -----------------------------------------------------
+            # Check previous signal event.
+            # -----------------------------------------------------
+
             with sqlite3.connect(self.db_path) as db:
-                if db.execute("SELECT 1 FROM signal_events WHERE account_key=? AND symbol=? AND signal_time=? AND side=?",(f"Production:{account}",symbol,stamp,side)).fetchone(): continue
-            status,details="Observed · monitor only","No order submitted."; external=""
-            qte=quotes.get(symbol,{})
-            bid,ask=number(qte,"bid"),number(qte,"ask")
-            price=yahoo_prices.get(symbol,0)
-            source="tastytrade"
-            if not bid or not ask:
-                if price>0: bid=ask=price; source="Yahoo delayed close"
-            if symbol in active: status,details="Blocked","Working broker order exists for symbol."
-            elif not row.get("universe_ok",True) and not qty_by.get(symbol): status,details="Blocked","Most Actives did not refresh; new automatic entries are paused."
-            elif dayloss and not qty_by.get(symbol): status,details="Blocked","Daily loss limit pauses new entries."
-            elif bid<=0 or ask<=0 or ask<bid: status,details="Blocked","No usable quote."
-            elif not source.startswith("Yahoo") and abs((ask if side=="BUY" else bid)-row["close"])/row["close"]*100>float(cfg["max_gap_pct"]): status,details="Blocked","Broker quote is too far from the Yahoo signal close."
-            else:
-                q=qty_by.get(symbol,0); action=None; qty=0; fractional=False
-                try:
-                    instrument=payload(client.get_equity(symbol)); fractional=bool(instrument.get("is-fractional-quantity-eligible"))
-                except Exception: pass
-                if side=="BUY":
-                    if q>0: status,details="Skipped","Long position already exists."
-                    elif q<0: action,qty="Buy to Close",math.floor(abs(q))
-                    else:
-                        exposure=sum(abs(pq)*pm for _,pq,pm in portfolio if pq>0)
-                        budget=min(nlv*float(cfg["allocation_pct"])/100,buying,cash,float(cfg["max_order_notional"]),max(0,nlv*float(cfg["max_portfolio_pct"])/100-exposure))
-                        qty=math.floor(budget/ask) if not fractional else math.floor(budget/ask*10000)/10000
-                        action="Buy to Open"
+
+                previous = db.execute(
+                    """
+                    SELECT status, external_id
+                    FROM signal_events
+                    WHERE account_key=?
+                    AND symbol=?
+                    AND signal_time=?
+                    AND side=?
+                    """,
+                    (
+                        account_key,
+                        symbol,
+                        stamp,
+                        side
+                    )
+                ).fetchone()
+
+            if previous:
+
+                previous_status = str(
+                    previous[0] or ""
+                )
+
+                # Do not submit the same signal twice.
+                # Submitted orders require broker reconciliation.
+                if previous_status in (
+                    "Submitted",
+                    "Contrarian close submitted",
+                    "Skipped",
+                    "Filled"
+                ):
+                    continue
+
+            # -----------------------------------------------------
+            # Current position
+            # -----------------------------------------------------
+
+            q = qty_by.get(symbol, 0.0)
+
+            last_side, loc = get_last_signal(frames[symbol])
+            contrarian_exit = (
+                (q > 0 and last_side == "SELL")
+                or (q < 0 and last_side == "BUY")
+            )
+
+            same_direction = (
+                (q > 0 and side == "BUY")
+                or (q < 0 and side == "SELL")
+            )
+
+            qte = quotes.get(symbol, {})
+
+            bid = number(qte, "bid")
+            ask = number(qte, "ask")
+
+            price = yahoo_prices.get(symbol, 0)
+
+            source = "tastytrade"
+
+            if bid <= 0 or ask <= 0:
+
+                if price > 0:
+                    bid = price
+                    ask = price
+                    source = "Yahoo delayed close"
+
+            action = None
+            qty = 0
+            fractional = False
+
+            status = "Observed · monitor only"
+            details = "No order submitted."
+            external = ""
+
+            # -----------------------------------------------------
+            # Get instrument fractional eligibility
+            # -----------------------------------------------------
+
+            try:
+
+                instrument = payload(
+                    client.get_equity(symbol)
+                )
+
+                fractional = bool(
+                    instrument.get(
+                        "is-fractional-quantity-eligible"
+                    )
+                )
+
+            except Exception:
+                pass
+
+            # =====================================================
+            # 8. PRIORITY 1: CONTRARIAN POSITION EXIT
+            # =====================================================
+
+            if contrarian_exit:
+
+                if (
+                    bid <= 0
+                    or ask <= 0
+                    or ask < bid
+                ):
+
+                    status = "Close blocked"
+
+                    details = (
+                        "No usable quote for contrarian exit."
+                    )
+
+                elif symbol in active:
+
+                    status = "Close pending"
+
+                    details = (
+                        "An existing working order must clear first."
+                    )
+
                 else:
-                    if q<0: status,details="Skipped","Short position already exists."
-                    elif q>0: action,qty="Sell to Close",round(q,4) if fractional else math.floor(q)
+
+                    action = (
+                        "Sell to Close"
+                        if q > 0
+                        else "Buy to Close"
+                    )
+
+                    qty = abs(q)
+
+                    if fractional:
+
+                        qty = round(qty, 4)
+
+                    elif not float(qty).is_integer():
+
+                        status = "Close blocked"
+
+                        details = (
+                            f"Position quantity {qty:g} is fractional, "
+                            "but the instrument does not support "
+                            "fractional orders."
+                        )
+
+                        qty = 0
+
                     else:
-                        short_exposure=sum(abs(pq)*pm for _,pq,pm in portfolio if pq<0)
-                        budget=min(nlv*float(cfg["allocation_pct"])/100,buying,float(cfg["max_order_notional"]),max(0,nlv*float(cfg["max_portfolio_pct"])/100-short_exposure))
-                        qty=math.floor(budget/bid); action="Sell to Open"
-                if action and qty>0:
-                    try:
-                        limit=ask if side=="BUY" else bid
-                        order=client.build_equity_order(symbol,action,qty,round(limit,2),source="StockTrader/2.0",
-                                allow_fractional=fractional and action in ("Buy to Open","Sell to Close"))
-                        external=order["external-identifier"]
-                        dry=payload(client.dry_run_order(account,order)); errs=dry.get("errors",[]) if isinstance(dry,dict) else []; warns=dry.get("warnings",[]) if isinstance(dry,dict) else []
-                        if errs or warns: raise TastytradeAPIError(f"Broker dry-run blocked: {errs} {warns}")
-                        client.submit_order(account,order,confirm_live=True,max_order_notional=float(cfg["max_order_notional"]),risk_reference_price=limit)
-                        status,details="Submitted",f"{action} {qty:g}; quote source: {source}"
-                        active.add(symbol)
-                    except Exception as exc: status,details="Order error / check broker",str(exc)[:500]
-            with sqlite3.connect(self.db_path) as db:
-                db.execute("INSERT OR REPLACE INTO signal_events(account_key,symbol,signal_time,side,status,details,external_id,created_at) VALUES(?,?,?,?,?,?,?,?)",(f"Production:{account}",symbol,stamp,side,status,details,external,datetime.now(PT).isoformat(timespec="seconds")))
+
+                        qty = int(qty)
+
+                    if qty <= 0 and status != "Close blocked":
+
+                        status = "Close blocked"
+
+                        details = (
+                            "Position quantity is below supported "
+                            "closing precision."
+                        )
+
+            # =====================================================
+            # 9. PRIORITY 2: PREVENT AUTOMATIC REVERSALS
+            # =====================================================
+
+            elif same_direction:
+
+                status = "Skipped"
+
+                details = (
+                    "Existing position already matches signal direction."
+                )
+
+            # =====================================================
+            # 10. PRIORITY 3: NORMAL ENTRY RESTRICTIONS
+            # =====================================================
+
+            else:
+
+                if symbol in active:
+
+                    status = "Blocked"
+
+                    details = (
+                        "Working broker order exists for symbol."
+                    )
+
+                elif not row.get("universe_ok", True):
+
+                    status = "Blocked"
+
+                    details = (
+                        "Most Actives unavailable; new entries paused."
+                    )
+
+                elif dayloss:
+
+                    status = "Blocked"
+
+                    details = (
+                        "Daily loss limit pauses new entries."
+                    )
+
+                elif (
+                    bid <= 0
+                    or ask <= 0
+                    or ask < bid
+                ):
+
+                    status = "Blocked"
+
+                    details = "No usable quote."
+
+                elif (
+                    source == "tastytrade"
+                    and (
+                        number(row, "close") <= 0
+                        or abs(
+                            (
+                                ask if side == "BUY"
+                                else bid
+                            ) - number(row, "close")
+                        ) / number(row, "close") * 100
+                        > float(cfg["max_gap_pct"])
+                    )
+                ):
+
+                    status = "Blocked"
+
+                    details = (
+                        "Broker quote is too far from "
+                        "Yahoo signal close."
+                    )
+
+                else:
+
+                    # ---------------------------------------------
+                    # Long entry
+                    # ---------------------------------------------
+
+                    if side == "BUY":
+
+                        long_exposure = sum(
+                            abs(pq) * pm
+                            for _, pq, pm in portfolio
+                            if pq > 0
+                        )
+
+                        budget = min(
+                            nlv * float(cfg["allocation_pct"]) / 100,
+                            buying,
+                            cash,
+                            float(cfg["max_order_notional"]),
+                            max(
+                                0,
+                                nlv * float(cfg["max_portfolio_pct"]) / 100
+                                - long_exposure
+                            )
+                        )
+
+                        qty = (
+                            math.floor(budget / ask * 10000) / 10000
+                            if fractional
+                            else math.floor(budget / ask)
+                        )
+
+                        action = "Buy to Open"
+
+                    # ---------------------------------------------
+                    # Short entry
+                    # ---------------------------------------------
+
+                    else:
+
+                        short_exposure = sum(
+                            abs(pq) * pm
+                            for _, pq, pm in portfolio
+                            if pq < 0
+                        )
+
+                        budget = min(
+                            nlv * float(cfg["allocation_pct"]) / 100,
+                            buying,
+                            float(cfg["max_order_notional"]),
+                            max(
+                                0,
+                                nlv * float(cfg["max_portfolio_pct"]) / 100
+                                - short_exposure
+                            )
+                        )
+
+                        qty = math.floor(budget / bid)
+
+                        action = "Sell to Open"
+
+            # =====================================================
+            # 11. SUBMIT ORDER
+            # =====================================================
+
+            if action and qty > 0:
+
+                try:
+
+                    limit = (
+                        bid
+                        if action.startswith("Sell")
+                        else ask
+                    )
+
+                    order = client.build_equity_order(
+                        symbol,
+                        action,
+                        qty,
+                        round(limit, 2),
+                        source=(
+                            "StockTrader/ContrarianExit"
+                            if contrarian_exit
+                            else "StockTrader/2.0"
+                        ),
+                        allow_fractional=(
+                            fractional
+                            and action in (
+                                "Buy to Open",
+                                "Sell to Close",
+                                "Buy to Close"
+                            )
+                        )
+                    )
+
+                    external = order["external-identifier"]
+
+                    # ---------------------------------------------
+                    # Broker dry run
+                    # ---------------------------------------------
+
+                    dry = payload(
+                        client.dry_run_order(account, order)
+                    )
+
+                    errors = (
+                        dry.get("errors", [])
+                        if isinstance(dry, dict)
+                        else []
+                    )
+
+                    broker_warnings = (
+                        dry.get("warnings", [])
+                        if isinstance(dry, dict)
+                        else []
+                    )
+
+                    if errors or broker_warnings:
+
+                        raise TastytradeAPIError(
+                            f"Broker dry-run blocked: "
+                            f"{errors} {broker_warnings}"
+                        )
+
+                    order_notional = qty * limit
+
+                    # ---------------------------------------------
+                    # Submit order
+                    # ---------------------------------------------
+
+                    client.submit_order(
+                        account,
+                        order,
+                        confirm_live=True,
+                        max_order_notional=(
+                            order_notional
+                            if contrarian_exit
+                            else float(cfg["max_order_notional"])
+                        ),
+                        risk_reference_price=limit
+                    )
+
+                    status = (
+                        "Contrarian close submitted"
+                        if contrarian_exit
+                        else "Submitted"
+                    )
+
+                    details = (
+                        f"{action} {qty:g}; "
+                        f"quote source: {source}"
+                    )
+
+                    # Prevent duplicate orders during this cycle.
+                    active.add(symbol)
+
+                    # Update in-memory position to prevent another
+                    # signal from treating the position as still flat.
+                    if contrarian_exit:
+                        qty_by[symbol] = 0.0
+
+                except Exception as exc:
+
+                    status = "Order error / check broker"
+
+                    details = str(exc)[:500]
+
+            # =====================================================
+            # 12. SAVE SUCCESSFUL OR TERMINAL SIGNAL EVENTS
+            # =====================================================
+
+            if status in (
+                "Submitted",
+                "Contrarian close submitted",
+                "Skipped"
+            ):
+
+                with sqlite3.connect(self.db_path) as db:
+
+                    db.execute(
+                        """
+                        INSERT OR REPLACE INTO signal_events
+                        (
+                            account_key,
+                            symbol,
+                            signal_time,
+                            side,
+                            status,
+                            details,
+                            external_id,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            account_key,
+                            symbol,
+                            stamp,
+                            side,
+                            status,
+                            details,
+                            external,
+                            datetime.now(PT).isoformat(
+                                timespec="seconds"
+                            )
+                        )
+                    )
+
+            else:
+
+                warnings.append(
+                    f"{symbol} {side}: {status} - {details}"
+                )

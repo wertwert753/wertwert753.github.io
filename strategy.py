@@ -210,3 +210,22 @@ def run_csv_backtest(prices: pd.DataFrame, starting_cash: float, amplitude: int,
                             for s, p in positions.items()],
                            columns=["Symbol", "Side", "Qty", "Entry", "Last", "Stop", "Unrealized P&L"])
     return eq, trade_df, open_df
+
+def get_last_signal(df):
+    buy_signals = df[df['buy_signal'] == True]
+    sell_signals = df[df['sell_signal'] == True]
+    if len(buy_signals) == 0 and len(sell_signals) == 0:
+        raise Exception('No Signals')
+    if len(buy_signals) == 0:
+        last_sell = sell_signals.index[-1]
+        loc = df.index.get_loc(last_sell)
+        return 'SELL', loc
+    if len(sell_signals) == 0:
+        last_buy = buy_signals.index[-1]
+        loc = df.index.get_loc(last_buy)
+        return 'BUY', loc
+    last_buy = buy_signals.index[-1]
+    last_sell = sell_signals.index[-1]
+    sell_loc = df.index.get_loc(last_sell)
+    buy_loc = df.index.get_loc(last_buy)
+    return 'BUY', buy_loc if last_buy > last_sell else 'SELL', sell_loc
