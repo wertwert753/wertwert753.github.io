@@ -211,21 +211,27 @@ def run_csv_backtest(prices: pd.DataFrame, starting_cash: float, amplitude: int,
                            columns=["Symbol", "Side", "Qty", "Entry", "Last", "Stop", "Unrealized P&L"])
     return eq, trade_df, open_df
 
+
 def get_last_signal(df):
-    buy_signals = df[df['buy_signal'] == True]
-    sell_signals = df[df['sell_signal'] == True]
+    """Return the most recent HalfTrend reversal as (signal, row location)."""
+
+    buy_signals = df.index[df["buy_signal"].fillna(False).astype(bool)]
+    sell_signals = df.index[df["sell_signal"].fillna(False).astype(bool)]
+
     if len(buy_signals) == 0 and len(sell_signals) == 0:
-        raise Exception('No Signals')
-    if len(buy_signals) == 0:
-        last_sell = sell_signals.index[-1]
-        loc = df.index.get_loc(last_sell)
-        return 'SELL', loc
-    if len(sell_signals) == 0:
-        last_buy = buy_signals.index[-1]
-        loc = df.index.get_loc(last_buy)
-        return 'BUY', loc
-    last_buy = buy_signals.index[-1]
-    last_sell = sell_signals.index[-1]
-    sell_loc = df.index.get_loc(last_sell)
-    buy_loc = df.index.get_loc(last_buy)
-    return 'BUY', buy_loc if last_buy > last_sell else 'SELL', sell_loc
+        return "HOLD", max(0, len(df) - 1)
+
+    last_buy_loc = (
+        df.index.get_loc(buy_signals[-1])
+        if len(buy_signals) else -1
+    )
+
+    last_sell_loc = (
+        df.index.get_loc(sell_signals[-1])
+        if len(sell_signals) else -1
+    )
+
+    if last_buy_loc > last_sell_loc:
+        return "BUY", last_buy_loc
+
+    return "SELL", last_sell_loc

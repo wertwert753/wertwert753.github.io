@@ -263,6 +263,30 @@ class TradingService:
             side = "BUY" if bool(row.buy_signal) else ("SELL" if bool(row.sell_signal) else "HOLD")
             close = float(frame.iloc[-1].Close)
             signal_time = str(result.index[-1])
+
+            contrarian_exit = False
+            last_position = None
+            with sqlite3.connect(self.db_path) as db:
+                positions = db.execute("SELECT * FROM sandbox_sim_positions")
+                for position in positions:
+                    if symbol == position[1]:
+                        last_position = position
+                        q = float(position[2])
+                        last_side, last_loc = get_last_signal(result)
+                        contrarian_exit = (
+                                        (q > 0 and last_side == "SELL")
+                                        or (q < 0 and last_side == "BUY")
+                                    )
+            if contrarian_exit:
+                side = last_side
+                signal_time = str(result.index[last_loc])
+
+            eod_sim_close = self.in_preclose_window()
+            if eod_sim_close:
+                last_order = "BUY" if float(last_position[1]) > 0 else "SELL"
+                side = "BUY" if last_order == "SELL" else "SELL"
+                signal_time = str(result.index[-1])
+
             record = {"symbol": symbol, "signal": side, "signal_time": signal_time,
                       "close": close, "bar_age_seconds": round(age),
                       "universe_ok": universe_ok,
@@ -939,10 +963,11 @@ class TradingService:
                 (q > 0 and last_side == "SELL")
                 or (q < 0 and last_side == "BUY")
             )
+            print(f"Contrarian Exit for symbol: {symbol} {contrarian_exit}")
 
             same_direction = (
-                (q > 0 and side == "BUY")
-                or (q < 0 and side == "SELL")
+                (q > 0 and last_side == "BUY")
+                or (q < 0 and last_side == "SELL")
             )
 
             qte = quotes.get(symbol, {})
