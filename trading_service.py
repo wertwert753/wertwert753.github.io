@@ -1,7 +1,7 @@
 """Trading and portfolio service used by the lightweight StockTrader web UI."""
 from __future__ import annotations
 
-from datetime import datetime, time as wall_time
+from datetime import datetime, time as wall_time, timezone
 import math
 from pathlib import Path
 import sqlite3
@@ -14,6 +14,7 @@ import pandas as pd
 
 from market_data import fetch_most_active_symbols, fetch_yfinance_delayed_closes, fetch_yfinance_ohlc
 from observed_universe import save_observed_symbols
+from position_log import PositionLog, record_position
 from sentiment_store import load_sentiment_snapshot, sentiment_priority
 from strategy import crossover_signals, get_last_signal
 from tastytrade_client_orders import PRODUCTION_URL, SANDBOX_URL, TastytradeAPIError, TastytradeClient
@@ -78,6 +79,7 @@ class TradingService:
         self.last_opening_scan_day = None
         self.finished = True # close all positions button spam safety flag
         self.init_db()
+        self.position_log = PositionLog(self.db_path)
 
     def init_db(self):
         with sqlite3.connect(self.db_path) as db:
@@ -165,6 +167,19 @@ class TradingService:
             self.auto_enabled = False
         return {"account_number": account, "accounts": accounts}
 
+    @staticmethod
+    def _record_sim_trade(db, key, now, symbol, stamp, signal, action, quantity, price, pnl, reason):
+        timestamp = now.isoformat()
+        db.execute("""
+            INSERT INTO sandbox_sim_trades
+                (account_key,trading_day,symbol,signal_time,signal,action,quantity,price,realized_pnl,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (key, now.date().isoformat(), symbol, stamp, signal, action, quantity, price, pnl, timestamp))
+        opened = action.startswith("SIM_OPEN_")
+        record_position(db, timestamp, "Sandbox", "OPENED" if opened else "CLOSED",
+                        action.rsplit("_", 1)[1], symbol, quantity, price=price,
+                        pnl=None if opened else pnl, source=reason)
+
     def close_all_positions(self):
         if self.finished == False:
             return
@@ -192,24 +207,14 @@ class TradingService:
                 realized_pnl = quantity * (mark - float(average_price))
                 close_stamp = now.isoformat(timespec="microseconds")
 
-                db.execute(
-                    """
-                    INSERT INTO sandbox_sim_trades
-                    (account_key,trading_day,symbol,signal_time,signal,action,
-                        quantity,price,realized_pnl,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        key, now.date().isoformat(), symbol, close_stamp, signal,
-                        action, abs(quantity), mark, realized_pnl,
-                        now.isoformat(timespec="seconds"),
-                    ),
-                )
+                self._record_sim_trade(db, key, now, symbol, close_stamp, signal, action,
+                                       abs(quantity), mark, realized_pnl, "manual")
                 db.execute(
                     "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
                     (key, symbol),
                 )
         self.finished = True
+        self.position_log.flush()
 
     def automate(self, action, arm=False, production_ack=False, live_phrase=""):
         with self.lock:
@@ -260,11 +265,17 @@ class TradingService:
             try:
                 balance = payload(client.get_balances(account))
                 positions = client.get_positions(account)
+                positions_as_of = datetime.now(timezone.utc)
                 orders = client.get_orders(account)
             except Exception as exc:
                 self.last_error = f"Broker refresh failed: {exc}"
                 balance, positions, orders = {}, [], []
                 warnings.append(self.last_error)
+            else:
+                try:
+                    self.position_log.observe_broker(account, positions, orders, positions_as_of)
+                except (ValueError, TypeError, KeyError, ArithmeticError, sqlite3.Error) as exc:
+                    warnings.append(f"Broker position logging failed: {exc}")
         else:
             balance, positions, orders = {}, [], []
 
@@ -420,6 +431,8 @@ class TradingService:
             events = [{"time": r[0], "symbol": r[1], "signal": r[2], "status": r[3], "details": r[4]} for r in events_rows]
 
         simulator = self._simulator_summary(cfg) if not production else {}
+        if self.position_log.write_error:
+            warnings.append(self.position_log.write_error)
         snapshot = {"environment": cfg["environment"], "signals": sorted(signals.values(), key=lambda x: x["priority"], reverse=True),
                     "positions": positions_out, "simulator": simulator, "equity": equity, "events": events,
                     "bars": bars, "warnings": warnings, "connected": bool(client and env == cfg["environment"]),
@@ -528,19 +541,8 @@ class TradingService:
                     realized_pnl = quantity * (mark - float(average_price))
                     close_stamp = now.isoformat(timespec="microseconds")
 
-                    db.execute(
-                        """
-                        INSERT INTO sandbox_sim_trades
-                        (account_key,trading_day,symbol,signal_time,signal,action,
-                         quantity,price,realized_pnl,created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        (
-                            key, now.date().isoformat(), symbol, close_stamp, signal,
-                            action, abs(quantity), mark, realized_pnl,
-                            now.isoformat(timespec="seconds"),
-                        ),
-                    )
+                    self._record_sim_trade(db, key, now, symbol, close_stamp, signal, action,
+                                           abs(quantity), mark, realized_pnl, "end_of_day")
                     db.execute(
                         "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
                         (key, symbol),
@@ -657,18 +659,8 @@ class TradingService:
                         )
 
                     if action != "NO_TRADE":
-                        db.execute(
-                            """
-                            INSERT OR IGNORE INTO sandbox_sim_trades
-                            (account_key,trading_day,symbol,signal_time,signal,action,
-                             quantity,price,realized_pnl,created_at)
-                            VALUES(?,?,?,?,?,?,?,?,?,?)
-                            """,
-                            (
-                                key, now.date().isoformat(), symbol, stamp, side, action,
-                                trade_qty, price, realized_pnl, now.isoformat(),
-                            ),
-                        )
+                        self._record_sim_trade(db, key, now, symbol, stamp, side, action,
+                                               trade_qty, price, realized_pnl, "signal")
 
             rows = db.execute(
                 """
@@ -691,6 +683,8 @@ class TradingService:
                 "INSERT INTO sandbox_sim_equity(account_key,timestamp,equity) VALUES(?,?,?)",
                 (key, now.isoformat(), equity),
             )
+
+        self.position_log.flush()
 
     def _simulator_summary(self, cfg):
         key=self._simulator_key()
