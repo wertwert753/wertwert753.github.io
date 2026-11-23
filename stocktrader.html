@@ -446,7 +446,7 @@ tr:last-child td { border-bottom: 0; }
 
             <div class="field">
                 <label>Lookback days</label>
-                <input id="days" type="number" value="7" min="1" max="30">
+                <input id="days" type="number" value="1" min="1" max="30">
             </div>
 
             <div class="field">
@@ -646,6 +646,19 @@ async function setVirtualEquity() {
     }
 }
 
+async function closeAllPositions(){
+    try {
+        const result = await call("/api/controls", {
+            settings: settings(),
+            action: "close_all_positions"
+        });
+
+        if (result.snapshot) render(result.snapshot);
+    } catch(e) {
+        alert(e.message);
+    }
+}
+
 function table(title, rows) {
     let html = `<h3 class="section">${esc(title)}</h3>`;
 
@@ -675,42 +688,167 @@ function table(title, rows) {
 }
 
 function lineChart(id, title, rows) {
-    if (!rows || !rows.length)
+    if (!Array.isArray(rows) || !rows.length) {
         return `<h3 class="section">${esc(title)}</h3>
                 <p class="caption">No history recorded yet.</p>`;
+    }
 
-    const start = $("equity-start")?.value || "";
+    const startDate = $("equity-start")?.value || "";
 
-    const filtered = start
-        ? rows.filter(x => String(x.time).slice(0,10) >= start)
-        : rows;
-
+    // The chart element is created by render() after this function returns.
+    // Resolve it inside setTimeout, after dashboard.innerHTML has been updated.
     setTimeout(() => {
-        const el = $(id);
-        if (!el || !window.Plotly) return;
+        try {
+            const el = $(id);
 
-        Plotly.react(el, [{
-            x: filtered.map(x => x.time),
-            y: filtered.map(x => x.value),
-            type: "scatter",
-            mode: "lines",
-            line: {color:"#2563eb",width:2}
-        }], {
-            title,
-            paper_bgcolor:"#fff",
-            plot_bgcolor:"#fff",
-            font:{color:"#172033"},
-            margin:{t:45,l:55,r:20,b:40},
-            xaxis:{gridcolor:"#e2e8f0"},
-            yaxis:{gridcolor:"#e2e8f0",tickprefix:"$"}
-        }, {
-            responsive:true,
-            displaylogo:false
-        });
+            if (!el) {
+                console.error("Chart element not found:", id);
+                return;
+            }
+
+            if (!window.Plotly) {
+                console.error("Plotly.js has not loaded.");
+                el.innerHTML = '<div class="notice error">Chart library failed to load. Check your internet connection or Plotly CDN access.</div>';
+                return;
+            }
+
+            // Filter without modifying the source rows.
+            const filtered = startDate
+                ? rows.filter(point =>
+                    point.time != null &&
+                    String(point.time).slice(0, 10) >= startDate
+                )
+                : rows;
+
+            // Validate expected equity-history fields.
+            const valid = filtered.filter(point =>
+                point &&
+                point.time != null &&
+                point.value != null &&
+                Number.isFinite(Number(point.value))
+            );
+
+            if (!valid.length) {
+                Plotly.react(el, [], {
+                    title: title + " — no valid data",
+                    paper_bgcolor: "#fff",
+                    plot_bgcolor: "#fff",
+                    font: { color: "#172033" }
+                });
+                return;
+            }
+
+            // Sort chronologically only when needed.
+            const sorted = valid.slice().sort((a, b) =>
+                String(a.time).localeCompare(String(b.time))
+            );
+
+            // Keep the complete history in the application/backend, but limit
+            // browser rendering to a screen-sized sample.
+            const maxPoints = Math.max(
+                2000,
+                Math.min(15000, Math.floor((el.clientWidth || 800) * 10))
+            );
+
+            function minMaxDownsample(data, limit) {
+                if (data.length <= limit) return data;
+
+                const bucketCount = Math.max(1, Math.floor(limit / 2));
+                const bucketSize = data.length / bucketCount;
+                const sampled = [];
+
+                for (let bucketIndex = 0; bucketIndex < bucketCount; bucketIndex++) {
+                    const from = Math.floor(bucketIndex * bucketSize);
+                    const to = Math.min(
+                        data.length,
+                        Math.floor((bucketIndex + 1) * bucketSize)
+                    );
+
+                    if (to <= from) continue;
+
+                    let minPoint = data[from];
+                    let maxPoint = data[from];
+
+                    for (let i = from + 1; i < to; i++) {
+                        const value = Number(data[i].value);
+                        if (value < Number(minPoint.value)) minPoint = data[i];
+                        if (value > Number(maxPoint.value)) maxPoint = data[i];
+                    }
+
+                    // Emit extrema in their original chronological order.
+                    if (minPoint === maxPoint) {
+                        sampled.push(minPoint);
+                    } else if (
+                        String(minPoint.time) <= String(maxPoint.time)
+                    ) {
+                        sampled.push(minPoint, maxPoint);
+                    } else {
+                        sampled.push(maxPoint, minPoint);
+                    }
+                }
+
+                return sampled;
+            }
+
+            const displayData = minMaxDownsample(sorted, maxPoints);
+
+            console.log(
+                `${title}: ${rows.length} source, ${valid.length} valid, ` +
+                `${displayData.length} rendered`
+            );
+
+            Plotly.react(el, [{
+                x: displayData.map(point => point.time),
+                y: displayData.map(point => Number(point.value)),
+                type: "scattergl",
+                mode: "lines",
+                name: title,
+                line: { color: "#2563eb", width: 1.5 },
+                connectgaps: false,
+                hovertemplate:
+                    "%{x}<br>$%{y:,.2f}<extra></extra>"
+            }], {
+                title,
+                paper_bgcolor: "#fff",
+                plot_bgcolor: "#fff",
+                font: { color: "#172033" },
+                margin: { t: 45, l: 65, r: 20, b: 45 },
+                xaxis: {
+                    type: "date",
+                    gridcolor: "#e2e8f0",
+                    rangeslider: { visible: false }
+                },
+                yaxis: {
+                    gridcolor: "#e2e8f0",
+                    tickprefix: "$",
+                    separatethousands: true,
+                    automargin: true
+                },
+                hovermode: "x unified"
+            }, {
+                responsive: true,
+                displaylogo: false,
+                scrollZoom: true
+            }).catch(error => {
+                console.error("Plotly rendering error:", error);
+                el.innerHTML =
+                    '<div class="notice error">Chart rendering failed: ' +
+                    esc(error.message || error) + '</div>';
+            });
+
+        } catch (error) {
+            console.error("Chart initialization error:", error);
+            const chart = $(id);
+            if (chart) {
+                chart.innerHTML =
+                    '<div class="notice error">Chart initialization failed: ' +
+                    esc(error.message || error) + '</div>';
+            }
+        }
     }, 0);
 
     return `<h3 class="section">${esc(title)}</h3>
-            <div id="${id}" class="chart"></div>`;
+            <div id="${esc(id)}" class="chart"></div>`;
 }
 
 function drawStock(symbol) {
@@ -730,14 +868,6 @@ function drawStock(symbol) {
             close:bars.close,
             type:"candlestick",
             name:symbol
-        },
-        {
-            x:bars.time,
-            y:bars.halftrend,
-            type:"scatter",
-            mode:"lines",
-            name:"HalfTrend",
-            line:{color:"#d97706",width:2}
         },
         {
             x:bars.time,
@@ -778,7 +908,7 @@ function render(d) {
 
     $("status").textContent =
         (d.environment || "") + " · " +
-        (d.automation ? "AUTOMATION ON" : "Automation off") +
+        (d.automation ? "Production AUTOMATION ON" : "Production Automation off") +
         " · " + (d.refreshed_at || "");
 
     let html = "";
@@ -809,6 +939,13 @@ function render(d) {
                          pct(s.total_profit_pct))}
                 ${metric("Virtual equity",money(s.equity_value))}
                 ${metric("Open positions",(d.positions || []).length)}
+            </div>
+        `;
+
+        html += `
+            <div class="close_button">
+            <button class="btn btn-secondary"
+                onclick="closeAllPositions()">Close All Positions</button>
             </div>
         `;
 
@@ -1114,6 +1251,7 @@ async function init() {
     if (e.target.id === "cfg-environment") {
         clearTimeout(settingsTimer);
         saveSettings();
+        loadSelectedEnvironment();
     } else {
         scheduleSave(200);
     }

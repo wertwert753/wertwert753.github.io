@@ -1,7 +1,7 @@
 """Trading and portfolio service used by the lightweight StockTrader web UI."""
 from __future__ import annotations
 
-from datetime import datetime, time as wall_time, timezone
+from datetime import datetime, time as wall_time
 import math
 from pathlib import Path
 import sqlite3
@@ -38,6 +38,18 @@ def payload(response):
     return response.get("data", response) if isinstance(response, dict) else response
 
 
+def is_current_entry_signal(signal_time, now_et):
+    """Match the originating candle to today's exchange date. Naive candles are Eastern."""
+    try:
+        stamp = datetime.fromisoformat(signal_time)
+    except (ValueError, TypeError):
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=ET)
+    stamp = stamp.astimezone(ET)
+    return stamp.date() == now_et.date() and stamp <= now_et
+
+
 class TradingService:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -48,6 +60,7 @@ class TradingService:
         self.accounts = []
         self.auto_enabled = False
         self.last_error = ""
+        self.yahoo_prices = {}
         self.settings = {
             "environment": "Sandbox", "interval": "1m", "period": "7d",
             "amplitude": 2, "channel_deviation": 2.0, "initial_capital": 500.0,
@@ -62,7 +75,8 @@ class TradingService:
                          "simulator": {}, "equity": [], "events": [], "bars": {},
                          "updated_at": None, "warnings": [], "connected": False,
                          "automation": False}
-        self.FIRST_TRADE = True
+        self.last_opening_scan_day = None
+        self.finished = True # close all positions button spam safety flag
         self.init_db()
 
     def init_db(self):
@@ -151,6 +165,52 @@ class TradingService:
             self.auto_enabled = False
         return {"account_number": account, "accounts": accounts}
 
+    def close_all_positions(self):
+        if self.finished == False:
+            return
+        self.finished = False
+        key, now = self._simulator_key(), datetime.now(PT)
+
+        with sqlite3.connect(self.db_path) as db:
+            open_positions = db.execute(
+                    """
+                    SELECT symbol, quantity, average_price, last_price
+                    FROM sandbox_sim_positions
+                    WHERE account_key=?
+                    """,
+                    (key,),
+                ).fetchall()
+
+            for symbol, quantity, average_price, last_price in open_positions:
+                mark = float(self.yahoo_prices.get(symbol, last_price) or last_price or 0.0)
+                quantity = float(quantity)
+                if mark <= 0 or quantity == 0:
+                    continue
+
+                action = "SIM_CLOSE_LONG" if quantity > 0 else "SIM_CLOSE_SHORT"
+                signal = "SELL" if quantity > 0 else "BUY"
+                realized_pnl = quantity * (mark - float(average_price))
+                close_stamp = now.isoformat(timespec="microseconds")
+
+                db.execute(
+                    """
+                    INSERT INTO sandbox_sim_trades
+                    (account_key,trading_day,symbol,signal_time,signal,action,
+                        quantity,price,realized_pnl,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        key, now.date().isoformat(), symbol, close_stamp, signal,
+                        action, abs(quantity), mark, realized_pnl,
+                        now.isoformat(timespec="seconds"),
+                    ),
+                )
+                db.execute(
+                    "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
+                    (key, symbol),
+                )
+        self.finished = True
+
     def automate(self, action, arm=False, production_ack=False, live_phrase=""):
         with self.lock:
             if action == "stop":
@@ -227,19 +287,16 @@ class TradingService:
 
         signals, usable, bars = {}, {}, {}
         sentiment = load_sentiment_snapshot(self.db_path, max_age_hours=24)
-        now = pd.Timestamp.now(tz="UTC")
+        now = pd.Timestamp(datetime.now(ET))
+        opening_scan = self.in_beginning_window(now) and self.last_opening_scan_day != now.date()
         mins = INTERVAL_MINUTES[cfg["interval"]]
-        count = 0
-        num_symbols = len(ohlc)
         frames = {}
         for symbol, frame in ohlc.items():
-            count += 1
             if len(frame) < max(10, int(cfg["amplitude"]) + 1):
                 continue
             result = crossover_signals(frame, amplitude=int(cfg["amplitude"]),
                                        channel_deviation=float(cfg["channel_deviation"]))
             stamp = pd.Timestamp(frame.index[-1])
-            frames[symbol] = result
             if stamp.tzinfo is None:
                 stamp = stamp.tz_localize(ET)
             bar_end = stamp + pd.Timedelta(minutes=mins)
@@ -253,44 +310,31 @@ class TradingService:
                 bar_end = stamp + pd.Timedelta(minutes=mins)
             if frame.empty:
                 continue
+
+            # Execution must use the same completed candles as the dashboard.
+            frames[symbol] = result
+
             age = max(0.0, (now - bar_end.tz_convert("UTC")).total_seconds())
-            loc = -1
-            if self.in_beginning_window() and self.FIRST_TRADE:
-                signal, loc = get_last_signal(result)
-                if count == (num_symbols - 1):
-                    self.FIRST_TRADE = False
+            last_side, last_loc = get_last_signal(result)
+            last_signal_time = str(result.index[last_loc])
+            loc = last_loc if opening_scan else -1
             row = result.iloc[loc]
             side = "BUY" if bool(row.buy_signal) else ("SELL" if bool(row.sell_signal) else "HOLD")
             close = float(frame.iloc[-1].Close)
-            signal_time = str(result.index[-1])
+            signal_time = str(result.index[loc])
+            if side != "HOLD" and not is_current_entry_signal(signal_time, now):
+                side, signal_time = "HOLD", str(result.index[-1])
+            if opening_scan and stamp.tz_convert(ET).date() == now.date():
+                self.last_opening_scan_day = now.date()
 
-            contrarian_exit = False
-            last_position = None
-            with sqlite3.connect(self.db_path) as db:
-                positions = db.execute("SELECT * FROM sandbox_sim_positions")
-                for position in positions:
-                    if symbol == position[1]:
-                        last_position = position
-                        q = float(position[2])
-                        last_side, last_loc = get_last_signal(result)
-                        contrarian_exit = (
-                                        (q > 0 and last_side == "SELL")
-                                        or (q < 0 and last_side == "BUY")
-                                    )
-            if contrarian_exit:
-                side = last_side
-                signal_time = str(result.index[last_loc])
-
-            eod_sim_close = self.in_preclose_window()
-            if eod_sim_close:
-                last_order = "BUY" if float(last_position[1]) > 0 else "SELL"
-                side = "BUY" if last_order == "SELL" else "SELL"
-                signal_time = str(result.index[-1])
+            # EOD simulator exits are handled explicitly in _simulator();
+            # never manufacture a BUY/SELL signal to represent an EOD close.
 
             record = {"symbol": symbol, "signal": side, "signal_time": signal_time,
                       "close": close, "bar_age_seconds": round(age),
                       "universe_ok": universe_ok,
-                      "sentiment": sentiment.get(symbol), "priority": sentiment_priority(side, sentiment.get(symbol))[1]}
+                      "sentiment": sentiment.get(symbol), "priority": sentiment_priority(side, sentiment.get(symbol))[1],
+                      "latest_signal":last_side, "latest_signal_time":last_signal_time}
             signals[symbol] = record
             usable[symbol] = frame
             bars[symbol] = {"time": [str(x) for x in frame.index[-300:]],
@@ -308,15 +352,15 @@ class TradingService:
                 quote_map = self._broker_quotes(client, symbols)
             except Exception as exc:
                 warnings.append(f"Tastytrade quotes unavailable: {exc}")
-        yahoo_prices = {}
+        self.yahoo_prices = {}
         for symbol, frame in usable.items():
             if not frame.empty and float(frame.Close.iloc[-1]) > 0:
-                yahoo_prices[symbol] = float(frame.Close.iloc[-1])
+                self.yahoo_prices[symbol] = float(frame.Close.iloc[-1])
         try:
             fallback = fetch_yfinance_delayed_closes(list(set(usable) | set(held) | set(symbols)), period="5d")
             for symbol, pair in fallback.items():
                 if pair and float(pair[0]) > 0:
-                    yahoo_prices.setdefault(symbol, float(pair[0]))
+                    self.yahoo_prices.setdefault(symbol, float(pair[0]))
         except Exception as exc:
             warnings.append(f"Yahoo delayed-price fallback unavailable: {exc}")
 
@@ -325,12 +369,12 @@ class TradingService:
             for item in positions:
                 symbol = str(item.get("underlying-symbol", item.get("symbol", ""))).upper()
                 qty = number(item, "quantity") * (-1 if str(item.get("quantity-direction", "Long")).lower() == "short" else 1)
-                mark = number(quote_map.get(symbol, {}), "mark", "mid", "last", default=yahoo_prices.get(symbol, 0))
+                mark = number(quote_map.get(symbol, {}), "mark", "mid", "last", default=self.yahoo_prices.get(symbol, 0))
                 average = number(item, "average-open-price")
                 positions_out.append({"symbol": symbol, "quantity": qty, "average_price": average,
                                       "mark": mark, "unrealized_pnl": (mark-average)*qty})
         else:
-            self._simulator(cfg, signals, yahoo_prices)
+            self._simulator(cfg, signals, self.yahoo_prices)
             positions_out = self._sim_positions(cfg)
 
         # Run normal production trading when automation is enabled.
@@ -346,7 +390,6 @@ class TradingService:
             and client
             and account
             and env == cfg["environment"]
-            and (auto or eod_closeout)
         ):
             self._execute_orders(
                 cfg,
@@ -357,7 +400,7 @@ class TradingService:
                 orders,
                 signals,
                 quote_map,
-                yahoo_prices,
+                self.yahoo_prices,
                 warnings,
                 frames
             )
@@ -445,44 +488,209 @@ class TradingService:
                  "unrealized_pnl": q*(p-a), "opened_at": t} for s,q,a,p,t in rows]
 
     def _simulator(self, cfg, signals, prices):
+        """Update the paper ledger; contrarian and EOD exits always take priority."""
         key, now = self._simulator_key(), datetime.now(PT)
+        now_et = now.astimezone(ET)
+        is_weekday = now_et.weekday() < 5
+        et_time = now_et.time().replace(tzinfo=None)
+        in_regular_session = is_weekday and wall_time(9, 30) <= et_time < wall_time(16, 0)
+        in_eod_window = self.in_preclose_window(now)
+
         with sqlite3.connect(self.db_path) as db:
+            # Refresh marks for all open positions.
             for symbol, price in prices.items():
-                db.execute("UPDATE sandbox_sim_positions SET last_price=? WHERE account_key=? AND symbol=?", (price,key,symbol))
-            day_open = now.astimezone(ET).replace(tzinfo=None).time()
-            if now.weekday()<5 and wall_time(9,30)<=day_open<wall_time(16,0):
-                for symbol,row in sorted(signals.items(),key=lambda kv:kv[1]["priority"],reverse=True):
-                    side=row["signal"]
-                    if side not in ("BUY","SELL") or symbol not in prices: continue
-                    stamp=row["signal_time"]
-                    if db.execute("SELECT 1 FROM sandbox_sim_trades WHERE account_key=? AND symbol=? AND signal_time=? AND signal=?",(key,symbol,stamp,side)).fetchone(): continue
-                    position=db.execute("SELECT quantity,average_price FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",(key,symbol)).fetchone()
-                    q,a=map(float,position) if position else (0.0,0.0)
-                    price=prices[symbol]; action="NO_TRADE"; realized=0.0; trade_qty=abs(q)
-                    if q==0:
-                        held=db.execute("SELECT quantity,average_price,last_price FROM sandbox_sim_positions WHERE account_key=?",(key,)).fetchall()
-                        realized_before=db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",(key,)).fetchone()[0]
-                        adjustment_before=db.execute("SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",(key,)).fetchone()[0]
-                        exposure=sum(abs(hq)*hmark for hq,havg,hmark in held)
-                        unrealized_before=sum(hq*(hmark-havg) for hq,havg,hmark in held)
-                        equity_before=max(0.0,float(cfg["initial_capital"])+float(realized_before)+unrealized_before+float(adjustment_before))
-                        budget=min(equity_before*float(cfg["sim_allocation_pct"])/100,
-                                   max(0.0,equity_before-exposure))
-                        trade_qty=round(budget/price,6) if budget>0 else 0
-                        if trade_qty:
-                            q=trade_qty if side=="BUY" else -trade_qty
-                            action="SIM_OPEN_LONG" if q>0 else "SIM_OPEN_SHORT"
-                            db.execute("INSERT INTO sandbox_sim_positions VALUES(?,?,?,?,?,?)",(key,symbol,q,price,price,now.isoformat()))
-                    elif (q>0 and side=="SELL") or (q<0 and side=="BUY"):
-                        realized=q*(price-a); action="SIM_CLOSE_LONG" if q>0 else "SIM_CLOSE_SHORT"
-                        db.execute("DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",(key,symbol))
-                    db.execute("INSERT OR IGNORE INTO sandbox_sim_trades(account_key,trading_day,symbol,signal_time,signal,action,quantity,price,realized_pnl,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(key,now.date().isoformat(),symbol,stamp,side,action,trade_qty,price,realized,now.isoformat()))
-            rows=db.execute("SELECT quantity,average_price,last_price FROM sandbox_sim_positions WHERE account_key=?",(key,)).fetchall()
-            realized=db.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",(key,)).fetchone()[0]
-            adjustments=db.execute("SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",(key,)).fetchone()[0]
-            pnl=float(realized)+sum(q*(mark-avg) for q,avg,mark in rows)
-            equity=float(cfg["initial_capital"])+pnl+float(adjustments)
-            db.execute("INSERT INTO sandbox_sim_equity(account_key,timestamp,equity) VALUES(?,?,?)",(key,now.isoformat(),equity))
+                if price and price > 0:
+                    db.execute(
+                        "UPDATE sandbox_sim_positions SET last_price=? WHERE account_key=? AND symbol=?",
+                        (price, key, symbol),
+                    )
+
+            # Explicitly close every simulator position during the Pacific EOD window.
+            # This is not a synthetic HalfTrend reversal and never opens the other side.
+            if in_eod_window:
+                open_positions = db.execute(
+                    """
+                    SELECT symbol, quantity, average_price, last_price
+                    FROM sandbox_sim_positions
+                    WHERE account_key=?
+                    """,
+                    (key,),
+                ).fetchall()
+
+                for symbol, quantity, average_price, last_price in open_positions:
+                    mark = float(prices.get(symbol, last_price) or last_price or 0.0)
+                    quantity = float(quantity)
+                    if mark <= 0 or quantity == 0:
+                        continue
+
+                    action = "SIM_EOD_CLOSE_LONG" if quantity > 0 else "SIM_EOD_CLOSE_SHORT"
+                    signal = "SELL" if quantity > 0 else "BUY"
+                    realized_pnl = quantity * (mark - float(average_price))
+                    close_stamp = now.isoformat(timespec="microseconds")
+
+                    db.execute(
+                        """
+                        INSERT INTO sandbox_sim_trades
+                        (account_key,trading_day,symbol,signal_time,signal,action,
+                         quantity,price,realized_pnl,created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            key, now.date().isoformat(), symbol, close_stamp, signal,
+                            action, abs(quantity), mark, realized_pnl,
+                            now.isoformat(timespec="seconds"),
+                        ),
+                    )
+                    db.execute(
+                        "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
+                        (key, symbol),
+                    )
+
+            elif in_regular_session:
+                for symbol, row in sorted(
+                    signals.items(),
+                    key=lambda kv: kv[1].get("priority", 0),
+                    reverse=True,
+                ):
+                    if symbol not in prices or float(prices[symbol] or 0) <= 0:
+                        continue
+
+                    price = float(prices[symbol])
+                    position = db.execute(
+                        """
+                        SELECT quantity, average_price
+                        FROM sandbox_sim_positions
+                        WHERE account_key=? AND symbol=?
+                        """,
+                        (key, symbol),
+                    ).fetchone()
+                    q, average_price = map(float, position) if position else (0.0, 0.0)
+
+                    # Use the latest completed HalfTrend reversal to close an
+                    # existing position, even when the current bar signal is HOLD.
+                    latest_side = str(row.get("latest_signal", row.get("signal", "HOLD"))).upper()
+                    latest_stamp = str(row.get("latest_signal_time") or row.get("signal_time") or now.isoformat())
+                    contrarian_side = (
+                        "SELL" if q > 0 and latest_side == "SELL"
+                        else "BUY" if q < 0 and latest_side == "BUY"
+                        else None
+                    )
+
+                    side = contrarian_side or str(row.get("signal", "HOLD")).upper()
+                    stamp = latest_stamp if contrarian_side else str(row.get("signal_time", ""))
+                    if side not in ("BUY", "SELL"):
+                        continue
+
+                    # Idempotency is keyed to the actual signal that caused the action.
+                    if db.execute(
+                        """
+                        SELECT 1 FROM sandbox_sim_trades
+                        WHERE account_key=? AND symbol=? AND signal_time=? AND signal=?
+                        """,
+                        (key, symbol, stamp, side),
+                    ).fetchone():
+                        continue
+
+                    action = "NO_TRADE"
+                    realized_pnl = 0.0
+                    trade_qty = 0.0
+
+                    if contrarian_side:
+                        # Close only. A contrarian exit never flips the position.
+                        realized_pnl = q * (price - average_price)
+                        action = "SIM_CLOSE_LONG" if q > 0 else "SIM_CLOSE_SHORT"
+                        trade_qty = abs(q)
+                        db.execute(
+                            "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
+                            (key, symbol),
+                        )
+
+                    elif q == 0:
+                        if not is_current_entry_signal(stamp, now_et):
+                            continue
+                        held = db.execute(
+                            """
+                            SELECT quantity,average_price,last_price
+                            FROM sandbox_sim_positions WHERE account_key=?
+                            """,
+                            (key,),
+                        ).fetchall()
+                        realized_before = db.execute(
+                            "SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",
+                            (key,),
+                        ).fetchone()[0]
+                        adjustment_before = db.execute(
+                            "SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",
+                            (key,),
+                        ).fetchone()[0]
+                        exposure = sum(abs(hq) * hmark for hq, havg, hmark in held)
+                        unrealized_before = sum(hq * (hmark - havg) for hq, havg, hmark in held)
+                        equity_before = max(
+                            0.0,
+                            float(cfg["initial_capital"]) + float(realized_before)
+                            + unrealized_before + float(adjustment_before),
+                        )
+                        budget = min(
+                            equity_before * float(cfg["sim_allocation_pct"]) / 100,
+                            max(0.0, equity_before - exposure),
+                        )
+                        trade_qty = round(budget / price, 6) if budget > 0 else 0.0
+                        if trade_qty > 0:
+                            signed_qty = trade_qty if side == "BUY" else -trade_qty
+                            action = "SIM_OPEN_LONG" if signed_qty > 0 else "SIM_OPEN_SHORT"
+                            db.execute(
+                                """
+                                INSERT INTO sandbox_sim_positions
+                                (account_key,symbol,quantity,average_price,last_price,opened_at)
+                                VALUES(?,?,?,?,?,?)
+                                """,
+                                (key, symbol, signed_qty, price, price, now.isoformat()),
+                            )
+
+                    elif (q > 0 and side == "SELL") or (q < 0 and side == "BUY"):
+                        realized_pnl = q * (price - average_price)
+                        action = "SIM_CLOSE_LONG" if q > 0 else "SIM_CLOSE_SHORT"
+                        trade_qty = abs(q)
+                        db.execute(
+                            "DELETE FROM sandbox_sim_positions WHERE account_key=? AND symbol=?",
+                            (key, symbol),
+                        )
+
+                    if action != "NO_TRADE":
+                        db.execute(
+                            """
+                            INSERT OR IGNORE INTO sandbox_sim_trades
+                            (account_key,trading_day,symbol,signal_time,signal,action,
+                             quantity,price,realized_pnl,created_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                key, now.date().isoformat(), symbol, stamp, side, action,
+                                trade_qty, price, realized_pnl, now.isoformat(),
+                            ),
+                        )
+
+            rows = db.execute(
+                """
+                SELECT quantity,average_price,last_price
+                FROM sandbox_sim_positions WHERE account_key=?
+                """,
+                (key,),
+            ).fetchall()
+            realized = db.execute(
+                "SELECT COALESCE(SUM(realized_pnl),0) FROM sandbox_sim_trades WHERE account_key=?",
+                (key,),
+            ).fetchone()[0]
+            adjustments = db.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM sandbox_sim_equity_adjustments WHERE account_key=?",
+                (key,),
+            ).fetchone()[0]
+            pnl = float(realized) + sum(q * (mark - avg) for q, avg, mark in rows)
+            equity = float(cfg["initial_capital"]) + pnl + float(adjustments)
+            db.execute(
+                "INSERT INTO sandbox_sim_equity(account_key,timestamp,equity) VALUES(?,?,?)",
+                (key, now.isoformat(), equity),
+            )
 
     def _simulator_summary(self, cfg):
         key=self._simulator_key()
@@ -501,7 +709,7 @@ class TradingService:
                 "daily_profit_pct":daily/float(cfg["initial_capital"])*100,
                 "total_profit_pct":total/float(cfg["initial_capital"])*100,
                 "unrealized_profit":unrealized,"equity_value":float(cfg["initial_capital"])+total+unrealized+float(adjustments),
-                "equity":[{"time":r[0],"value":r[1]} for r in equity[-1000:]],
+                "equity":[{"time":r[0],"value":r[1]} for r in equity],
                 "daily":[{"day":r[0],"realized_pnl":r[1]} for r in daily_history],
                 "trades":[{"day":r[0],"symbol":r[1],"signal":r[2],"action":r[3],"quantity":r[4],"price":r[5],"realized_pnl":r[6],"time":r[7]} for r in trades]}
 
@@ -899,7 +1107,7 @@ class TradingService:
             signals.values(),
             key=lambda row: (
                 row["priority"],
-                row.get("sentiment", {}).get("confidence", 0)
+                (row.get("sentiment") or {}).get("confidence", 0)
             ),
             reverse=True
         )
@@ -908,15 +1116,37 @@ class TradingService:
 
             symbol = row["symbol"]
             side = row["signal"]
-            stamp = row["signal_time"]
+            stamp = row.get("signal_time")
 
-            if side not in ("BUY", "SELL"):
+            if symbol not in frames:
                 continue
 
-            # -----------------------------------------------------
-            # Check previous signal event.
-            # -----------------------------------------------------
+            # Always inspect the most recent actual HalfTrend reversal.
+            last_side, last_loc = get_last_signal(frames[symbol])
 
+            q = qty_by.get(symbol, 0.0)
+
+            # A BUY signal closes a short.
+            # A SELL signal closes a long.
+            contrarian_exit = (
+                (q > 0 and last_side == "SELL")
+                or
+                (q < 0 and last_side == "BUY")
+            )
+
+            # Override HOLD or an outdated signal when a position
+            # requires a contrarian exit.
+            if contrarian_exit:
+                side = last_side
+                stamp = str(frames[symbol].index[last_loc])
+
+            # Only skip HOLD if there is no required exit.
+            if side not in ("BUY", "SELL"):
+                continue
+            if not contrarian_exit and not is_current_entry_signal(stamp, now_et):
+                continue
+
+            # Check duplicate events AFTER identifying the exit.
             with sqlite3.connect(self.db_path) as db:
 
                 previous = db.execute(
@@ -928,42 +1158,24 @@ class TradingService:
                     AND signal_time=?
                     AND side=?
                     """,
-                    (
-                        account_key,
-                        symbol,
-                        stamp,
-                        side
-                    )
+                    (account_key, symbol, stamp, side)
                 ).fetchone()
 
-            if previous:
-
-                previous_status = str(
-                    previous[0] or ""
-                )
-
-                # Do not submit the same signal twice.
-                # Submitted orders require broker reconciliation.
-                if previous_status in (
-                    "Submitted",
-                    "Contrarian close submitted",
-                    "Skipped",
-                    "Filled"
-                ):
+            # Ordinary same-direction signals remain idempotent. A prior
+            # contrarian submission is retried if the position is still open
+            # and there is no longer a working broker order for this symbol.
+            if previous and previous[0] in (
+                "Submitted",
+                "Skipped",
+                "Filled",
+                "Contrarian close submitted",
+                "Contrarian close submitted (awaiting fill)",
+            ):
+                # A still-open position with an opposite signal must always
+                # be reconsidered. The active-order branch below prevents
+                # duplicate closes and requests cancellation when appropriate.
+                if not contrarian_exit:
                     continue
-
-            # -----------------------------------------------------
-            # Current position
-            # -----------------------------------------------------
-
-            q = qty_by.get(symbol, 0.0)
-
-            last_side, loc = get_last_signal(frames[symbol])
-            contrarian_exit = (
-                (q > 0 and last_side == "SELL")
-                or (q < 0 and last_side == "BUY")
-            )
-            print(f"Contrarian Exit for symbol: {symbol} {contrarian_exit}")
 
             same_direction = (
                 (q > 0 and last_side == "BUY")
@@ -1019,24 +1231,55 @@ class TradingService:
 
             if contrarian_exit:
 
+                whole_share_market_close = (
+                    not fractional and float(abs(q)).is_integer()
+                )
+
                 if (
-                    bid <= 0
-                    or ask <= 0
-                    or ask < bid
+                    not whole_share_market_close
+                    and (bid <= 0 or ask <= 0 or ask < bid)
                 ):
 
                     status = "Close blocked"
 
                     details = (
-                        "No usable quote for contrarian exit."
+                        "No usable two-sided quote for fractional contrarian exit."
                     )
 
                 elif symbol in active:
 
-                    status = "Close pending"
+                    cancel_requested = False
+                    cancel_errors = []
+                    for working in working_orders:
+                        if symbol not in working["symbols"]:
+                            continue
+                        order_data = working["order"]
+                        working_source = str(working.get("source", "")).lower()
+                        # Never cancel our own already-submitted contrarian
+                        # close merely because it is still working.
+                        if "stocktrader/contrarianexit" in working_source:
+                            cancel_requested = True
+                            continue
+                        order_id = str(
+                            order_data.get("id", order_data.get("order-id", ""))
+                        )
+                        if not order_id:
+                            cancel_errors.append("working order has no broker order ID")
+                            continue
+                        try:
+                            client.cancel_order(account, order_id)
+                            cancel_requested = True
+                        except Exception as cancel_exc:
+                            cancel_errors.append(f"{order_id}: {cancel_exc}")
 
+                    status = "Close pending"
                     details = (
-                        "An existing working order must clear first."
+                        "Cancellation requested for conflicting working order(s); "
+                        "the broker must report a terminal state and the position must "
+                        "be reconciled before another close is sent."
+                        if cancel_requested and not cancel_errors
+                        else "A conflicting working order must clear before closing. "
+                             + ("; ".join(cancel_errors) if cancel_errors else "")
                     )
 
                 else:
@@ -1096,7 +1339,15 @@ class TradingService:
 
             else:
 
-                if symbol in active:
+                if not self.auto_enabled:
+
+                    status = "Observed · automatic trading disabled"
+
+                    details = (
+                        "New entries are disabled; contrarian risk-reducing exits remain enabled."
+                    )
+
+                elif symbol in active:
 
                     status = "Blocked"
 
@@ -1226,27 +1477,39 @@ class TradingService:
                         else ask
                     )
 
-                    order = client.build_equity_order(
-                        symbol,
-                        action,
-                        qty,
-                        round(limit, 2),
-                        source=(
-                            "StockTrader/ContrarianExit"
-                            if contrarian_exit
-                            else "StockTrader/2.0"
-                        ),
-                        allow_fractional=(
-                            fractional
-                            and action in (
-                                "Buy to Open",
-                                "Sell to Close",
-                                "Buy to Close"
+                    if (
+                        contrarian_exit
+                        and not fractional
+                        and float(qty).is_integer()
+                    ):
+                        order = client.build_equity_market_close(
+                            symbol,
+                            action,
+                            int(qty),
+                            source="StockTrader/ContrarianExit",
+                        )
+                    else:
+                        order = client.build_equity_order(
+                            symbol,
+                            action,
+                            qty,
+                            round(limit, 2),
+                            source=(
+                                "StockTrader/ContrarianExit"
+                                if contrarian_exit
+                                else "StockTrader/2.0"
+                            ),
+                            allow_fractional=(
+                                fractional
+                                and action in (
+                                    "Buy to Open",
+                                    "Sell to Close",
+                                    "Buy to Close"
+                                )
                             )
                         )
-                    )
 
-                    external = order["external-identifier"]
+                    external = order.get("external-identifier", "")
 
                     # ---------------------------------------------
                     # Broker dry run
@@ -1275,10 +1538,18 @@ class TradingService:
                             f"{errors} {broker_warnings}"
                         )
 
-                    order_notional = qty * limit
+                    reference_price = (
+                        number(qte, "mark", "mid", "last", default=price)
+                        if contrarian_exit
+                        else limit
+                    )
+                    order_notional = (
+                        qty * reference_price if reference_price > 0 else None
+                    )
 
                     # ---------------------------------------------
-                    # Submit order
+                    # Submit order. A market order is not a fill
+                    # confirmation; the next refresh must reconcile it.
                     # ---------------------------------------------
 
                     client.submit_order(
@@ -1290,11 +1561,13 @@ class TradingService:
                             if contrarian_exit
                             else float(cfg["max_order_notional"])
                         ),
-                        risk_reference_price=limit
+                        risk_reference_price=(
+                            reference_price if reference_price > 0 else None
+                        )
                     )
 
                     status = (
-                        "Contrarian close submitted"
+                        "Contrarian close submitted (awaiting fill)"
                         if contrarian_exit
                         else "Submitted"
                     )
@@ -1324,7 +1597,7 @@ class TradingService:
 
             if status in (
                 "Submitted",
-                "Contrarian close submitted",
+                "Contrarian close submitted (awaiting fill)",
                 "Skipped"
             ):
 

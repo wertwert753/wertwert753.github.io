@@ -7,6 +7,7 @@ import ipaddress
 import os
 from urllib.parse import urlsplit
 from pathlib import Path
+from dotenv import load_dotenv
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request
@@ -32,7 +33,7 @@ async def refresh_worker():
             await asyncio.to_thread(run_due_sentiment, APP_DIR / "trading_dashboard.sqlite3")
         except Exception as exc:
             service.last_error = f"Scheduled sentiment analysis failed: {exc}"
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 @asynccontextmanager
@@ -124,6 +125,8 @@ async def controls(request: Controls, _local=Depends(is_local_request)):
                     raise HTTPException(400, "Enter a virtual equity amount.")
                 await asyncio.to_thread(service.set_virtual_equity, request.virtual_equity)
                 result = {"virtual_equity": request.virtual_equity}
+            elif request.action == "close_all_positions":
+                result = await asyncio.to_thread(service.close_all_positions)
             elif request.action in {"start", "stop"}:
                 service.automate(request.action, request.arm, request.production_ack, request.live_phrase)
                 result = {"automation": service.auto_enabled}
@@ -191,5 +194,6 @@ def sentiment(request: SentimentRequest, _local=Depends(is_local_request)):
 
 if __name__ == "__main__":
     import uvicorn
+    load_dotenv("tastytrade.env")
     uvicorn.run("stocktrader:app", host=os.getenv("STOCKTRADER_HOST", "0.0.0.0"),
                 port=int(os.getenv("STOCKTRADER_PORT", "8765")), reload=False)
